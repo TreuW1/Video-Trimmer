@@ -2,7 +2,7 @@
 
 ## About
 VideoTrimmer is a desktop video trimming and compression application built with
-Tauri and Svelte, Designed for short form clips. See [INSTALL.md](INSTALL.md) for development and build setup.
+Tauri, Svelte and Node.js, designed for short form clips. See [INSTALL.md](INSTALL.md) for development and build setup.
 
 ## Usage
 
