@@ -1,0 +1,74 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build outputs
+build/
+dist/
+.output/
+.vite/
+*.exe
+*.dll
+*.pdb
+
+# Tauri build outputs
+src-tauri/target/
+src-tauri/gen/
+src-tauri/backend-dist/
+
+# Frontend build outputs
+video-editor-frontend/build/
+video-editor-frontend/.svelte-kit/
+video-editor-frontend/.output/
+custom-compression-presets.json
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+temp/
+tmp/
+uploads/
+outputs/
+
+# Vercel/Netlify
+.vercel
+.netlify
+.wrangler
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# Cargo
+**/target/
+**/Cargo.lock
+
+# Local setup scripts and root package manifest
+*.ps
+*.ps1
+/package.json
+start-app.bat
+

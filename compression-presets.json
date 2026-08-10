@@ -1,0 +1,103 @@
+[
+  {
+    "id": "original",
+    "name": "Original",
+    "description": "Original quality",
+    "processingStrategy": "directCopy",
+    "videoCodec": "copy",
+    "audioCodec": "copy",
+    "options": [],
+    "targetSizePercent": 100
+  },
+  {
+    "id": "balanced",
+    "name": "Balanced",
+    "description": "Good balance between quality and size (40% of original)",
+    "processingStrategy": "bitrateTarget",
+    "videoCodec": "libx265",
+    "audioCodec": "aac",
+    "options": [
+      "-preset medium",
+      "-movflags faststart",
+      "-profile:v main",
+      "-level 4.0"
+    ],
+    "targetSizePercent": 40,
+    "estimatedTime": "Medium",
+    "qualityLevel": "High"
+  },
+  {
+    "id": "high quality",
+    "name": "High Quality",
+    "description": "Best quality compression (60% reduction)",
+    "processingStrategy": "bitrateTarget",
+    "videoCodec": "libx265",
+    "audioCodec": "aac",
+    "options": [
+      "-preset medium",
+      "-movflags faststart",
+      "-profile:v main",
+      "-level 4.2"
+    ],
+    "targetSizePercent": 60,
+    "estimatedTime": "Slow",
+    "qualityLevel": "Very High"
+  },
+  {
+    "id": "10mb",
+    "name": "10MB Target",
+    "description": "Compress to under 10MB file size",
+    "processingStrategy": "sizeTarget",
+    "videoCodec": "libx265",
+    "audioCodec": "aac",
+    "options": [
+      "-preset slow",
+      "-movflags faststart",
+      "-profile:v main",
+      "-level 4.0"
+    ],
+    "targetSizeMB": 9.5,
+    "sizeLimitMB": 10,
+    "sizeLabel": "~10 MB",
+    "estimatedTime": "Medium",
+    "qualityLevel": "Adaptive"
+  },
+  {
+    "id": "50mb",
+    "name": "50MB Target",
+    "description": "Compress to under 50MB file size",
+    "processingStrategy": "sizeTarget",
+    "videoCodec": "libx265",
+    "audioCodec": "aac",
+    "options": [
+      "-preset slow",
+      "-movflags faststart",
+      "-profile:v main",
+      "-level 4.1"
+    ],
+    "targetSizeMB": 45,
+    "sizeLimitMB": 50,
+    "sizeLabel": "~50 MB",
+    "estimatedTime": "Medium",
+    "qualityLevel": "Adaptive"
+  },
+  {
+    "id": "100mb",
+    "name": "100MB Target",
+    "description": "Compress to under 100MB file size",
+    "processingStrategy": "sizeTarget",
+    "videoCodec": "libx265",
+    "audioCodec": "aac",
+    "options": [
+      "-preset slow",
+      "-movflags faststart",
+      "-profile:v high",
+      "-level 4.1"
+    ],
+    "targetSizeMB": 90,
+    "sizeLimitMB": 100,
+    "sizeLabel": "~100 MB",
+    "estimatedTime": "Medium",
+    "qualityLevel": "Adaptive"
+  }
+]

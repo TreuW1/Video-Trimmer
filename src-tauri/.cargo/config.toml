@@ -1,0 +1,20 @@
+# Cargo configuration for optimized builds
+[build]
+# Use release profile by default for builds
+# This can be overridden with --profile flag
+
+[target.x86_64-pc-windows-gnu]
+# Optimize linker for smaller binaries
+linker = "x86_64-w64-mingw32-gcc"
+rustflags = [
+    "-C", "link-arg=-Wl,--gc-sections",
+    "-C", "link-arg=-Wl,--strip-all",
+]
+
+[target.x86_64-pc-windows-msvc]
+# For MSVC toolchain
+rustflags = [
+    "-C", "link-arg=/OPT:REF",
+    "-C", "link-arg=/OPT:ICF",
+]
+
