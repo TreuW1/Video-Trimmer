@@ -34,6 +34,7 @@
   import { formatElapsedTime, formatTime, parseTime } from '$lib/utils/time';
   import { animateProgressValue } from '$lib/utils/progressAnimation';
   import { calculateExpectedOutputSize } from '$lib/utils/estimatedOutputSize';
+  import { API_BASE, apiFetch, getBackendToken } from '$lib/backendApi';
   import {
     createAdaptiveTimelineScrubConfig,
     createTimelineScrubThrottle,
@@ -45,10 +46,11 @@
   import { handleEditorKeybind } from '$lib/utils/editorKeybinds';
   import uploadLimits from '../../../upload-limits.json';
    
-  const API_BASE = "http://localhost:3000";
+  const fetch = apiFetch;
   const OUTPUT_DIRECTORY_KEY = 'trimmerOutputDirectory';
   const GENERATE_OUTPUT_FILENAME_KEY = 'trimmerGenerateOutputFilename';
   const HARDWARE_ACCELERATION_KEY = 'trimmerHardwareAcceleration';
+  const POPUP_NOTIFICATIONS_KEY = 'trimmerPopupNotifications';
   const HIDDEN_COMPRESSION_PRESETS_KEY = 'trimmerHiddenCompressionPresetIds';
   const CHANGE_VIDEO_SOURCE_KEY = 'trimmerPreferredChangeVideoSource';
   const LIBRARY_SCROLL_TOP_KEY = 'video_library_scroll_top';
@@ -56,7 +58,6 @@
     typeof uploadLimits.maxUploadBytes === 'number' && Number.isFinite(uploadLimits.maxUploadBytes)
       ? uploadLimits.maxUploadBytes
       : null;
-  const VIDEO_DIALOG_EXTENSIONS = ['mp4', 'webm', 'avi', 'mov', 'mkv', 'mpeg', 'mpg', 'm4v', 'ogv', 'ogg', '3gp'];
   type DisplayCompressionPreset = CompressionPreset & { hidden?: boolean };
   type ChangeVideoSource = 'file' | 'library';
   type CompletedOutput = {
@@ -93,10 +94,11 @@
   let statusMessage = $state("");
   let statusType = $state("");
   let showStatus = $state(false);
+  let popupNotificationsEnabled = $state(false);
   let showLoadingOverlay = $state(false);
   let loadingMessage = $state("Uploading video...");
   let loadingTitle = $state("Processing Video");
-  let serverStatusMessage = $state("🔄 Checking server connection...");
+  let serverStatusMessage = $state("Checking server connection...");
   let serverStatusClass = $state("server-status");
   let useSpinner = $state(false);
   let progressPercent = $state(0);
@@ -584,14 +586,11 @@
     try {
       const { isTauri } = await import('@tauri-apps/api/core');
       if (await isTauri()) {
-        const { open } = await import('@tauri-apps/plugin-dialog');
-        const selected = await open({
+        const { invoke } = await import('@tauri-apps/api/core');
+        const paths = await invoke<string[]>('pick_video_files', {
           multiple: mode === 'add',
-          title: mode === 'replace' ? 'Change Active Track Video' : 'Add Video Tracks',
-          filters: [{ name: 'Videos', extensions: VIDEO_DIALOG_EXTENSIONS }]
+          title: mode === 'replace' ? 'Change Active Track Video' : 'Add Video Tracks'
         });
-
-        const paths = Array.isArray(selected) ? selected : typeof selected === 'string' ? [selected] : [];
         const videoPaths = paths.filter(isVideoPath);
 
         if (paths.length > 0 && videoPaths.length === 0) {
@@ -1326,10 +1325,20 @@
 
       const savedOutputDirectory = localStorage.getItem(OUTPUT_DIRECTORY_KEY);
       if (savedOutputDirectory) {
-        outputDirectory = savedOutputDirectory;
+        try {
+          const { invoke, isTauri } = await import('@tauri-apps/api/core');
+          if (await isTauri() && await invoke<boolean>('is_output_path_authorized', { path: savedOutputDirectory })) {
+            outputDirectory = savedOutputDirectory;
+          } else {
+            localStorage.removeItem(OUTPUT_DIRECTORY_KEY);
+          }
+        } catch {
+          localStorage.removeItem(OUTPUT_DIRECTORY_KEY);
+        }
       }
       generateOutputFilename = localStorage.getItem(GENERATE_OUTPUT_FILENAME_KEY) === 'true';
       hardwareAccelerationEnabled = localStorage.getItem(HARDWARE_ACCELERATION_KEY) === 'true';
+      popupNotificationsEnabled = localStorage.getItem(POPUP_NOTIFICATIONS_KEY) === 'true';
       
       // Add page lifecycle event listeners for better back/forward cache handling
       document.addEventListener('pageshow', handlePageShow);
@@ -1499,7 +1508,7 @@
       });
       
       if (response.ok) {
-        updateServerStatus('✅ Server online - Ready to process videos!', true);
+        updateServerStatus('Server online - Ready to process videos!', true);
         if (compressionModes.length === 0) {
           try {
             const modesRes = await fetch(`${API_BASE}/compression-modes`);
@@ -1517,7 +1526,7 @@
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';
       console.error('Server connection error:', errorMessage);
-      updateServerStatus('❌ Server offline - Please start the Node.js server', false);
+      updateServerStatus('Server offline - Please start the Node.js server', false);
     }
   }
 
@@ -1700,6 +1709,7 @@
 
           const xhr = new XMLHttpRequest();
           xhr.open('POST', `${API_BASE}/upload`, true);
+          xhr.setRequestHeader('X-Video-Trimmer-Token', await getBackendToken());
 
           xhr.upload.onprogress = (e: ProgressEvent) => {
             if (e.lengthComputable) {
@@ -1788,6 +1798,8 @@
   }
 
   function displayStatus(message: string, type: string): void {
+    if (!popupNotificationsEnabled) return;
+
     statusMessage = message;
     statusType = type;
     showStatus = true;
@@ -2213,6 +2225,12 @@
     });
   }
 
+  function setPopupNotificationsEnabled(enabled: boolean): void {
+    popupNotificationsEnabled = enabled;
+    localStorage.setItem(POPUP_NOTIFICATIONS_KEY, String(enabled));
+    if (!enabled) showStatus = false;
+  }
+
   function persistOutputDirectory(): void {
     if (!browser) return;
     if (outputDirectory) {
@@ -2235,12 +2253,8 @@
         return false;
       }
 
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: 'Select Output Folder'
-      });
+      const { invoke } = await import('@tauri-apps/api/core');
+      const selected = await invoke<string | null>('pick_output_directory');
 
       if (typeof selected === 'string') {
         outputDirectory = selected;
@@ -2687,7 +2701,7 @@
 
 
 <!-- Main Container -->
-<div class="h-screen w-screen flex flex-col bg-gray-900 overflow-hidden text-white {isFullscreen ? 'fullscreen-mode' : ''}"> 
+<div class="trimmer-scrollbar h-screen w-screen flex flex-col bg-gray-900 overflow-hidden text-white {isFullscreen ? 'fullscreen-mode' : ''}">
   <!-- Header Bar with Server Status -->
   {#if !isFullscreen}
   <header class="h-12 bg-gray-800/50 px-4 sm:px-6 flex items-center justify-between gap-2 shadow-xl z-10 border-b border-gray-800">
@@ -2699,10 +2713,12 @@
         {outputDirectory}
         {generateOutputFilename}
         {hardwareAccelerationEnabled}
+        {popupNotificationsEnabled}
         {chooseOutputDirectory}
         {clearOutputDirectory}
         {setGenerateOutputFilename}
         {setHardwareAccelerationEnabled}
+        {setPopupNotificationsEnabled}
         {openCompressionPresetModal}
       />
     </div>
@@ -3178,7 +3194,7 @@
       />
     {/if}
   </div>
-  <StatusToast show={showStatus} message={statusMessage} type={statusType} />
+  <StatusToast show={popupNotificationsEnabled && showStatus} message={statusMessage} type={statusType} />
 </div>
 
 <LoadingOverlay
@@ -3211,7 +3227,9 @@
   }}
 />
 
-<UploadQueue {uploadQueue} />
+{#if popupNotificationsEnabled}
+  <UploadQueue {uploadQueue} />
+{/if}
 
 <CompressionPresetModal
   open={compressionPresetModalOpen}

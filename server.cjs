@@ -1,30 +1,58 @@
 const express = require('express');
 const multer = require('multer');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
-const { pipeline } = require('stream/promises');
 const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
 const { spawn } = require('child_process');
 const compression = require('compression');
-const ffmpeg = require('fluent-ffmpeg');
 const builtInCompressionPresets = require('./compression-presets.json');
+const { checkForUpdate } = require('./update-check.cjs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = '127.0.0.1';
+const API_TOKEN = process.env.VIDEO_TRIMMER_AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
+const ALLOWED_ORIGINS = new Set(
+    (process.env.VIDEO_TRIMMER_ALLOWED_ORIGINS ||
+        'http://localhost:5173,http://127.0.0.1:5173,http://tauri.localhost,https://tauri.localhost,tauri://localhost')
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+);
 
 const uploadLimits = require('./upload-limits.json');
-const MAX_UPLOAD_BYTES = Number.isFinite(uploadLimits.maxUploadBytes)
-    ? uploadLimits.maxUploadBytes
-    : null;
+const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = Number.isSafeInteger(uploadLimits.maxUploadBytes) && uploadLimits.maxUploadBytes > 0
+    ? Math.min(uploadLimits.maxUploadBytes, DEFAULT_MAX_UPLOAD_BYTES)
+    : DEFAULT_MAX_UPLOAD_BYTES;
 
-// Enable CORS for all routes
+// Browser access is limited to the packaged app and the local Vite development server.
 app.use(cors({
-    origin: '*',
+    origin(origin, callback) {
+        if (!origin || ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+        const error = new Error('Origin is not allowed');
+        error.statusCode = 403;
+        return callback(error);
+    },
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'X-Video-Trimmer-Token'],
+    maxAge: 600
 }));
+
+function tokenMatches(candidate) {
+    if (typeof candidate !== 'string') return false;
+    const supplied = Buffer.from(candidate);
+    const expected = Buffer.from(API_TOKEN);
+    return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
+app.use((req, res, next) => {
+    if (tokenMatches(req.get('X-Video-Trimmer-Token'))) return next();
+    res.set('Cache-Control', 'no-store');
+    return res.status(401).json({ error: 'Unauthorized' });
+});
 
 // Enable compression for all responses
 app.use(compression({
@@ -38,13 +66,24 @@ app.use(compression({
     }
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
 
 // Create directories for uploads and outputs
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-const OUTPUT_DIR = path.join(__dirname, 'outputs');
-const TEMP_DIR = path.join(__dirname, 'temp');
-const CUSTOM_COMPRESSION_PRESETS_PATH = path.join(__dirname, 'custom-compression-presets.json');
+const DATA_DIR = path.resolve(process.env.VIDEO_TRIMMER_DATA_DIR || __dirname);
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+const OUTPUT_DIR = path.join(DATA_DIR, 'outputs');
+const TEMP_DIR = path.join(DATA_DIR, 'temp');
+const CUSTOM_COMPRESSION_PRESETS_PATH = path.join(DATA_DIR, 'custom-compression-presets.json');
+const SCOPES_FILE = process.env.VIDEO_TRIMMER_SCOPES_FILE
+    ? path.resolve(process.env.VIDEO_TRIMMER_SCOPES_FILE)
+    : null;
+const APP_VERSION = (() => {
+    try {
+        return fsSync.readFileSync(path.join(__dirname, 'VERSION'), 'utf8').trim();
+    } catch {
+        return process.env.VIDEO_TRIMMER_VERSION || '0.0.0';
+    }
+})();
 
 // Track uploaded videos
 const uploadedVideos = new Map();
@@ -54,9 +93,117 @@ async function resolveOutputDirectory(outputDirectory) {
         return OUTPUT_DIR;
     }
 
-    const resolved = path.resolve(outputDirectory.trim());
-    await fs.mkdir(resolved, { recursive: true });
+    const resolved = await fs.realpath(path.resolve(outputDirectory.trim()));
+    const scopes = await readFilesystemScopes();
+    if (!scopes.outputDirectories.some((directory) => pathIsWithin(resolved, directory))) {
+        const error = new Error('Output folder has not been authorized with the native folder picker');
+        error.statusCode = 403;
+        throw error;
+    }
     return resolved;
+}
+
+function pathIsWithin(candidate, directory) {
+    const relative = path.relative(directory, candidate);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+async function readFilesystemScopes() {
+    if (!SCOPES_FILE) return { readFiles: [], libraryDirectories: [], outputDirectories: [] };
+    try {
+        const parsed = JSON.parse(await fs.readFile(SCOPES_FILE, 'utf8'));
+        return {
+            readFiles: Array.isArray(parsed.readFiles) ? parsed.readFiles.map((value) => path.resolve(value)) : [],
+            libraryDirectories: Array.isArray(parsed.libraryDirectories) ? parsed.libraryDirectories.map((value) => path.resolve(value)) : [],
+            outputDirectories: Array.isArray(parsed.outputDirectories) ? parsed.outputDirectories.map((value) => path.resolve(value)) : []
+        };
+    } catch (error) {
+        if (error.code !== 'ENOENT') console.warn(`Could not read filesystem scopes: ${error.message}`);
+        return { readFiles: [], libraryDirectories: [], outputDirectories: [] };
+    }
+}
+
+async function isAuthorizedInputPath(candidate) {
+    const scopes = await readFilesystemScopes();
+    return scopes.readFiles.includes(candidate) ||
+        scopes.libraryDirectories.some((directory) => pathIsWithin(candidate, directory));
+}
+
+function probeMedia(inputPath) {
+    return new Promise((resolve, reject) => {
+        const child = spawn('ffprobe', [
+            '-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', inputPath
+        ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (chunk) => { stdout += chunk; });
+        child.stderr.on('data', (chunk) => { stderr = `${stderr}${chunk}`.slice(-12000); });
+        child.on('error', reject);
+        child.on('close', (code) => {
+            if (code !== 0) return reject(new Error(stderr.trim() || `ffprobe exited with code ${code}`));
+            try {
+                const metadata = JSON.parse(stdout);
+                if (metadata.format) {
+                    metadata.format.duration = Number(metadata.format.duration);
+                    metadata.format.size = Number(metadata.format.size);
+                }
+                resolve(metadata);
+            } catch (error) {
+                reject(new Error(`Could not parse ffprobe output: ${error.message}`));
+            }
+        });
+    });
+}
+
+function runDirectFfmpeg(args, { duration = null, progressCallback = null, job = null, label = 'FFmpeg' } = {}) {
+    return new Promise((resolve, reject) => {
+        const fullArgs = ['-hide_banner', '-y', '-progress', 'pipe:2', '-nostats', ...args];
+        console.log(`${label} command: ffmpeg ${fullArgs.join(' ')}`);
+        const child = spawn('ffmpeg', fullArgs, { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'] });
+        if (job) job.ffmpegProcess = child;
+        let stderrOutput = '';
+        let buffered = '';
+        child.stderr.on('data', (chunk) => {
+            const text = chunk.toString();
+            stderrOutput = `${stderrOutput}${text}`.slice(-12000);
+            buffered += text;
+            const lines = buffered.split(/\r?\n/);
+            buffered = lines.pop() || '';
+            if (!progressCallback || !duration) return;
+            for (const line of lines) {
+                const match = /^(?:out_time|time)=(\d{2}:\d{2}:\d{2}(?:\.\d+)?)/.exec(line.trim());
+                if (!match) continue;
+                const seconds = parseFfmpegTimemark(match[1]);
+                if (Number.isFinite(seconds)) {
+                    progressCallback(formatProgressPercent((seconds / duration) * 100));
+                }
+            }
+        });
+        child.on('error', (error) => {
+            if (job) job.ffmpegProcess = null;
+            reject(error);
+        });
+        child.on('close', (code) => {
+            if (job) job.ffmpegProcess = null;
+            if (code === 0) return resolve();
+            reject(new Error(stderrOutput.trim() || `${label} exited with code ${code}`));
+        });
+    });
+}
+
+function buildEncodingArgs(input, output, {
+    startTime = null,
+    duration = null,
+    inputOptions = [],
+    videoCodec,
+    audioCodec,
+    outputOptions = []
+}) {
+    const args = [...inputOptions];
+    if (startTime != null) args.push('-ss', String(startTime));
+    if (duration != null) args.push('-t', String(duration));
+    args.push('-i', input, '-c:v', videoCodec, '-c:a', audioCodec, ...outputOptions, '-f', 'mp4', output);
+    return args;
 }
 
 function normalizeOutputFilename(outputFilename, compressionMode) {
@@ -106,12 +253,7 @@ async function createOutputTarget(outputDirectory, compressionMode, requestedFil
 
 // Helper function to calculate target video bitrate based on desired output size percentage or fixed size
 async function calculateTargetBitrate(inputPath, targetSizePercent, duration = null, targetSizeMB = null) {
-    return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(inputPath, (err, metadata) => {
-            if (err) {
-                reject(err);
-                return;
-            }
+    const metadata = await probeMedia(inputPath);
 
             // Get file size in bytes 
             let fileSizeInBytes = metadata.format.size ? parseInt(metadata.format.size, 10) : null;
@@ -119,15 +261,13 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
                 try {
                     fileSizeInBytes = fsSync.statSync(inputPath).size;
                 } catch (e) {
-                    reject(e);
-                    return;
+                    throw e;
                 }
             }
 
             const fullDuration = metadata.format.duration;
             if (!fullDuration || !Number.isFinite(fullDuration) || fullDuration <= 0) {
-                reject(new Error('Could not determine media duration for bitrate calculation'));
-                return;
+                throw new Error('Could not determine media duration for bitrate calculation');
             }
 
             // Output segment length (trim window). When encoding from original + -ss/-t, this is the
@@ -156,8 +296,7 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
                 console.log(`🎯 Using fixed target size: ${targetSizeMB} MB`);
             } else {
                 if (targetSizePercent == null || !Number.isFinite(targetSizePercent)) {
-                    reject(new Error('targetSizePercent is required when targetSizeMB is not set'));
-                    return;
+                    throw new Error('targetSizePercent is required when targetSizeMB is not set');
                 }
                 // Percentage of the proportional size of the segment being exported
                 targetFileSizeBytes = segmentSizeBytes * (targetSizePercent / 100);
@@ -195,14 +334,12 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
             console.log(`   Target video bitrate: ${(finalVideoBitrate / 1000).toFixed(0)} kbps`);
             console.log(`   Target audio bitrate: ${(finalAudioBitrate / 1000).toFixed(0)} kbps`);
             
-            resolve({
+            return {
                 targetVideoBitrate: Math.round(finalVideoBitrate),
                 audioBitrate: Math.round(finalAudioBitrate),
                 currentVideoBitrate: Math.round(currentVideoBitrate),
                 compressionRatio: ((currentVideoBitrate - finalVideoBitrate) / currentVideoBitrate * 100).toFixed(1)
-            });
-        });
-    });
+            };
 }
 
 const DEFAULT_COMPRESSION_MODE = 'balanced';
@@ -677,15 +814,18 @@ const storage = multer.diskStorage({
         cb(null, UPLOAD_DIR);
     },
     filename: (req, file, cb) => {
-        // Keep original filename for easy identification
-        cb(null, file.originalname);
+        const extension = path.extname(path.basename(file.originalname)).toLowerCase();
+        cb(null, `${crypto.randomUUID()}${extension}`);
     }
 });
 
 const upload = multer({
     storage: storage,
-    limits: MAX_UPLOAD_BYTES ? { fileSize: MAX_UPLOAD_BYTES } : undefined,
+    limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 8 },
     fileFilter: (req, file, cb) => {
+        const allowedExtensions = new Set([
+            '.mp4', '.webm', '.avi', '.mov', '.mkv', '.mpeg', '.mpg', '.m4v', '.ogv', '.ogg', '.3gp'
+        ]);
         const allowedMimes = [
             'video/mp4',
             'video/mpeg',
@@ -697,7 +837,7 @@ const upload = multer({
             'video/3gpp'
         ];
         
-        if (allowedMimes.includes(file.mimetype)) {
+        if (allowedMimes.includes(file.mimetype) && allowedExtensions.has(path.extname(file.originalname).toLowerCase())) {
             cb(null, true);
         } else {
             cb(new Error('Invalid file type. Please upload a video file.'));
@@ -772,7 +912,7 @@ function formatProgressPercent(percent) {
 async function cleanupOldFiles() {
     console.log('Running cleanup task...');
     const directories = [UPLOAD_DIR, OUTPUT_DIR, TEMP_DIR];
-    const maxAge = 60 * 60 * 1000 * 2; // 2 hours
+    const maxAge = 24 * 60 * 60 * 1000; // 1 day
     let cleanedCount = 0;
     
     // Clean up uploaded videos map
@@ -962,6 +1102,20 @@ app.get('/compression-modes', (req, res) => {
     });
 });
 
+// Check the latest published GitHub release without exposing GitHub to the webview CSP.
+app.get('/update-check', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    try {
+        res.json(await checkForUpdate(APP_VERSION));
+    } catch (error) {
+        console.warn(`Update check failed: ${error.message}`);
+        if (error.code === 'NO_PUBLIC_RELEASE') {
+            return res.status(404).json({ error: 'No public releases are available yet.' });
+        }
+        res.status(502).json({ error: 'Could not check for updates. Please try again later.' });
+    }
+});
+
 app.post('/compression-modes/custom', async (req, res) => {
     try {
         const normalized = normalizeCompressionPreset(req.body);
@@ -1056,7 +1210,6 @@ app.post('/check-video', express.json(), async (req, res) => {
             return res.status(400).json({ error: 'Filename and size are required' });
         }
         
-        const filePath = path.join(UPLOAD_DIR, filename);
         const inputSizeMB = (size / (1024 * 1024)).toFixed(2);
         
         // Check if video already exists in our tracking
@@ -1074,7 +1227,7 @@ app.post('/check-video', express.json(), async (req, res) => {
         // If found in map, check if file still exists on disk
         if (existingVideoId) {
             try {
-                await fs.access(filePath);
+                await fs.access(uploadedVideos.get(existingVideoId).path);
                 // File exists, return existing ID
                 return res.json({
                     exists: true,
@@ -1092,37 +1245,6 @@ app.post('/check-video', express.json(), async (req, res) => {
             }
         }
         
-        // Check if file exists on disk (but not in map)
-        try {
-            const stats = await fs.stat(filePath);
-            const existingSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-            
-            // If file exists with same size, add to map and return
-            if (existingSizeMB == inputSizeMB) {
-                const videoId = uuidv4();
-                uploadedVideos.set(videoId, {
-                    id: videoId,
-                    path: filePath,
-                    originalName: filename,
-                    size: existingSizeMB,
-                    uploadedAt: new Date().toISOString()
-                });
-                
-                console.log(`Found existing file "${filename}", added to tracking`);
-                
-                return res.json({
-                    exists: true,
-                    videoId,
-                    status: 'already_uploaded',
-                    message: 'Video already exists on server',
-                    originalName: filename,
-                    size: existingSizeMB
-                });
-            }
-        } catch (e) {
-            // File doesn't exist, continue
-        }
-        
         // File doesn't exist, needs to be uploaded
         return res.json({
             exists: false,
@@ -1138,28 +1260,15 @@ app.post('/check-video', express.json(), async (req, res) => {
 });
 
 // New upload endpoint for background upload
-app.post('/upload', async (req, res, next) => {
+app.post('/upload', upload.single('video'), async (req, res) => {
     try {
-        // Only accept upload if file doesn't exist (check should be done client-side first)
-        const tempUpload = multer({
-            storage: multer.memoryStorage(),
-            limits: MAX_UPLOAD_BYTES ? { fileSize: MAX_UPLOAD_BYTES } : undefined
-        }).single('video');
-        
-        await new Promise((resolve, reject) => {
-            tempUpload(req, res, (err) => {
-                if (err) reject(err);
-                else resolve();
-            });
-        });
-
         if (!req.file) {
             return res.status(400).json({ error: 'No video file uploaded' });
         }
 
-        const originalName = req.file.originalname;
+        const originalName = path.basename(req.file.originalname);
         const fileSize = req.file.size;
-        const filePath = path.join(UPLOAD_DIR, originalName);
+        const filePath = req.file.path;
         
         // Double-check if video already exists (in case check wasn't called)
         let existingVideoId = null;
@@ -1167,7 +1276,7 @@ app.post('/upload', async (req, res, next) => {
         
         // First check in uploadedVideos map
         for (const [videoId, info] of uploadedVideos.entries()) {
-            if (info.path === filePath && info.size == inputSizeMB) {
+            if (info.originalName === originalName && info.size == inputSizeMB) {
                 existingVideoId = videoId;
                 console.log(`Video "${originalName}" already tracked with ID: ${videoId}`);
                 break;
@@ -1177,7 +1286,8 @@ app.post('/upload', async (req, res, next) => {
         // If found in map, check if file still exists on disk
         if (existingVideoId) {
             try {
-                await fs.access(filePath);
+                await fs.access(uploadedVideos.get(existingVideoId).path);
+                await fs.unlink(filePath).catch(() => {});
                 // File exists, return existing ID
                 return res.json({
                     videoId: existingVideoId,
@@ -1194,40 +1304,7 @@ app.post('/upload', async (req, res, next) => {
             }
         }
         
-        // Check if file exists on disk (but not in map)
-        try {
-            const stats = await fs.stat(filePath);
-            const existingSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-            
-            // If file exists with same size, add to map and return
-            if (existingSizeMB == inputSizeMB) {
-                const videoId = uuidv4();
-                uploadedVideos.set(videoId, {
-                    id: videoId,
-                    path: filePath,
-                    originalName: originalName,
-                    size: existingSizeMB,
-                    uploadedAt: new Date().toISOString()
-                });
-                
-                console.log(`Found existing file "${originalName}", added to tracking`);
-                
-                return res.json({
-                    videoId,
-                    status: 'already_uploaded',
-                    message: 'Video already exists on server',
-                    originalName: originalName,
-                    size: existingSizeMB
-                });
-            }
-        } catch (e) {
-            // File doesn't exist, continue with upload
-        }
-        
-        // File is new or different, save it
-        await fs.writeFile(filePath, req.file.buffer);
-        
-        const videoId = uuidv4();
+        const videoId = crypto.randomUUID();
         uploadedVideos.set(videoId, {
             id: videoId,
             path: filePath,
@@ -1246,6 +1323,7 @@ app.post('/upload', async (req, res, next) => {
             size: inputSizeMB
         });
     } catch (error) {
+        if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
         console.error('Upload endpoint error:', error);
         res.status(500).json({ 
             error: 'Internal server error',
@@ -1269,7 +1347,7 @@ app.post('/upload-from-path', async (req, res) => {
             return res.status(400).json({ error: 'path is required (absolute path to the video file)' });
         }
 
-        const sourcePath = path.resolve(rawPath.trim());
+        let sourcePath = path.resolve(rawPath.trim());
         let srcStat;
         try {
             srcStat = await fs.stat(sourcePath);
@@ -1280,11 +1358,15 @@ app.post('/upload-from-path', async (req, res) => {
         if (!srcStat.isFile()) {
             return res.status(400).json({ error: 'path must be a regular file' });
         }
+        sourcePath = await fs.realpath(sourcePath);
+        if (!(await isAuthorizedInputPath(sourcePath))) {
+            return res.status(403).json({ error: 'File is outside the folders selected in the native picker' });
+        }
         if (srcStat.size === 0) {
             return res.status(400).json({ error: 'File is empty' });
         }
-        if (MAX_UPLOAD_BYTES !== null && srcStat.size > MAX_UPLOAD_BYTES) {
-            return res.status(400).json({ error: 'File exceeds maximum size' });
+        if (srcStat.size > MAX_UPLOAD_BYTES) {
+            return res.status(413).json({ error: 'File exceeds the 10 GB maximum size' });
         }
 
         const originalName = path.basename(sourcePath);
@@ -1312,7 +1394,7 @@ app.post('/upload-from-path', async (req, res) => {
             });
         }
 
-        const videoId = uuidv4();
+        const videoId = crypto.randomUUID();
         uploadedVideos.set(videoId, {
             id: videoId,
             path: sourcePath,
@@ -1376,7 +1458,7 @@ app.post('/trim', express.json(), async (req, res) => {
             }
             const outputTarget = await createOutputTarget(outputDirectory, compressionMode, outputFilename);
             const compressionConfig = COMPRESSION_MODES[compressionMode];
-            const jobId = uuidv4();
+            const jobId = crypto.randomUUID();
             const createdAt = new Date();
             jobs.set(jobId, {
                 id: jobId,
@@ -1444,7 +1526,7 @@ app.post('/trim', express.json(), async (req, res) => {
         const compressionConfig = COMPRESSION_MODES[compressionMode];
 
         // Create a job ID for async processing
-        const jobId = uuidv4();
+        const jobId = crypto.randomUUID();
         
         const createdAt = new Date();
         jobs.set(jobId, {
@@ -1857,12 +1939,7 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                     const currentDuration =
                         trimDurationSec != null && Number.isFinite(trimDurationSec) && trimDurationSec > 0
                             ? trimDurationSec
-                            : await new Promise((resolve, reject) => {
-                                  ffmpeg.ffprobe(input, (err, metadata) => {
-                                      if (err) reject(err);
-                                      else resolve(metadata.format.duration);
-                                  });
-                              });
+                            : (await probeMedia(input)).format.duration;
 
                     // Calculate bitrate for target size, then apply reduction
                     const { targetVideoBitrate, audioBitrate } = await calculateTargetBitrate(
@@ -1889,48 +1966,29 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                         isHardwareAccelerationEnabled(job),
                         job
                     );
-                    const command = ffmpeg(input);
                     const inputOptions = getHardwareInputOptions(preset.videoCodec, hardwareAcceleration);
-                    if (inputOptions.length > 0) {
-                        command.inputOptions(inputOptions);
-                    }
-                    if (
+                    const shouldTrim =
                         trimStartSec != null &&
                         trimDurationSec != null &&
                         Number.isFinite(trimStartSec) &&
                         Number.isFinite(trimDurationSec) &&
-                        trimDurationSec > 0
-                    ) {
-                        command.setStartTime(trimStartSec).setDuration(trimDurationSec);
-                    }
-                    command
-                        .output(output)
-                        .videoCodec(videoCodec)
-                        .audioCodec(preset.audioCodec)
-                        .format('mp4')
-                        .addOptions(buildStructuredEncodingOptions(preset, {
+                        trimDurationSec > 0;
+                    const outputOptions = buildStructuredEncodingOptions(preset, {
                             targetVideoBitrate: adjustedVideoBitrate,
                             audioBitrate: finalAudioBitrate
                         }, {
                             hardwareAcceleration,
                             videoCodec
-                        }));
+                        });
 
                     const presetOptions = getPresetOptionsForAcceleration(
                         [...(preset.options || []), ...(preset.extraOptions || [])],
                         hardwareAcceleration,
                         videoCodec
                     );
-                    if (presetOptions.length > 0) {
-                        command.addOptions(presetOptions);
-                    }
-
-                    if (progressCallback) {
-                        command.on('progress', (progress) => {
-                            const rawPercent = getEncodingProgressPercent(progress, currentDuration);
-                            if (rawPercent != null) {
-                                const percent = formatProgressPercent(rawPercent);
-                                
+                    outputOptions.push(...presetOptions);
+                    const onProgress = progressCallback ? (percent) => {
+                                const rawPercent = percent;
                                 // Update job message to include iteration information if available
                                 if (job) {
                                     // Calculate time elapsed since iteration started
@@ -1951,46 +2009,23 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                                         `\nElapsed: ${elapsedText}` +
                                         (etaText ? `\nETA: ${etaText}` : '');
                                 }
-                                
                                 progressCallback(percent);
-                            }
-                        });
-                    }
+                    } : null;
 
-                    await new Promise((resolve, reject) => {
-                        let stderrOutput = '';
-                        command
-                            .on('start', (commandLine) => {
-                                console.log(`[Iteration ${iteration}] FFmpeg command: ${commandLine}`);
-                                if (job) {
-                                    setTimeout(() => {
-                                        if (command.ffmpegProc) {
-                                            job.ffmpegProcess = command.ffmpegProc;
-                                        }
-                                    }, 100);
-                                }
-                            })
-                            .on('stderr', (line) => {
-                                stderrOutput += `${line}\n`;
-                                if (stderrOutput.length > 12000) {
-                                    stderrOutput = stderrOutput.slice(-12000);
-                                }
-                            })
-                            .on('end', () => {
-                                if (job) job.ffmpegProcess = null;
-                                console.log(`[Iteration ${iteration}] Single-pass encoding completed`);
-                                resolve();
-                            })
-                            .on('error', (err) => {
-                                if (job) job.ffmpegProcess = null;
-                                console.error(`[Iteration ${iteration}] Encoding error:`, err);
-                                if (stderrOutput.trim()) {
-                                    console.error(`[Iteration ${iteration}] FFmpeg stderr: ${stderrOutput.trim()}`);
-                                }
-                                reject(err);
-                            })
-                            .run();
+                    await runDirectFfmpeg(buildEncodingArgs(input, output, {
+                        startTime: shouldTrim ? trimStartSec : null,
+                        duration: shouldTrim ? trimDurationSec : null,
+                        inputOptions,
+                        videoCodec,
+                        audioCodec: preset.audioCodec,
+                        outputOptions
+                    }), {
+                        duration: currentDuration,
+                        progressCallback: onProgress,
+                        job,
+                        label: `[Iteration ${iteration}]`
                     });
+                    console.log(`[Iteration ${iteration}] Single-pass encoding completed`);
 
                     // Check output size against limit (not target)
                     const outputSizeMB = await getFileSizeMB(output);
@@ -2048,12 +2083,7 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
 
                 const inputStat = await fs.stat(inputPath);
                 const inputSizeMB = inputStat.size / (1024 * 1024);
-                const fullDurSec = await new Promise((resolve, reject) => {
-                    ffmpeg.ffprobe(inputPath, (err, metadata) => {
-                        if (err) reject(err);
-                        else resolve(metadata.format.duration);
-                    });
-                });
+                const fullDurSec = (await probeMedia(inputPath)).format.duration;
                 const estTrimmedMB =
                     fullDurSec > 0 ? inputSizeMB * Math.min(1, duration / fullDurSec) : inputSizeMB;
                 console.log(
@@ -2098,79 +2128,30 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                     config.targetSizeMB
                 );
 
-                const command = ffmpeg(inputPath)
-                    .setStartTime(startTime)
-                    .setDuration(duration)
-                    .output(outputPath)
-                    .videoCodec(videoCodec)
-                    .audioCodec(config.audioCodec)
-                    .format('mp4')
-                    .addOptions(buildStructuredEncodingOptions(config, {
+                const outputOptions = buildStructuredEncodingOptions(config, {
                         targetVideoBitrate,
                         audioBitrate
                     }, {
                         hardwareAcceleration,
                         videoCodec
-                    }));
+                    });
 
                 const inputOptions = getHardwareInputOptions(config.videoCodec, hardwareAcceleration);
-                if (inputOptions.length > 0) {
-                    command.inputOptions(inputOptions);
-                }
-
                 const presetOptions = getPresetOptionsForAcceleration(
                     [...(config.options || []), ...(config.extraOptions || [])],
                     hardwareAcceleration,
                     videoCodec
                 );
-                if (presetOptions.length > 0) {
-                    command.addOptions(presetOptions);
-                }
-
-                if (progressCallback) {
-                    command.on('progress', (progress) => {
-                        const rawPercent = getEncodingProgressPercent(progress, duration);
-                        if (rawPercent != null) {
-                            const percent = formatProgressPercent(rawPercent);
-                            progressCallback(percent);
-                        }
-                    });
-                }
-
-                await new Promise((resolve, reject) => {
-                    let stderrOutput = '';
-                    command
-                        .on('start', (commandLine) => {
-                            console.log(`[${config.name}] FFmpeg command: ${commandLine}`);
-                            if (job) {
-                                setTimeout(() => {
-                                    if (command.ffmpegProc) {
-                                        job.ffmpegProcess = command.ffmpegProc;
-                                    }
-                                }, 100);
-                            }
-                        })
-                        .on('stderr', (line) => {
-                            stderrOutput += `${line}\n`;
-                            if (stderrOutput.length > 12000) {
-                                stderrOutput = stderrOutput.slice(-12000);
-                            }
-                        })
-                        .on('end', () => {
-                            if (job) job.ffmpegProcess = null;
-                            console.log(`[${config.name}] Compression completed`);
-                            resolve();
-                        })
-                        .on('error', (err) => {
-                            if (job) job.ffmpegProcess = null;
-                            console.error(`[${config.name}] Compression error:`, err);
-                            if (stderrOutput.trim()) {
-                                console.error(`[${config.name}] FFmpeg stderr: ${stderrOutput.trim()}`);
-                            }
-                            reject(err);
-                        })
-                        .run();
-                });
+                outputOptions.push(...presetOptions);
+                await runDirectFfmpeg(buildEncodingArgs(inputPath, outputPath, {
+                    startTime,
+                    duration,
+                    inputOptions,
+                    videoCodec,
+                    audioCodec: config.audioCodec,
+                    outputOptions
+                }), { duration, progressCallback, job, label: `[${config.name}]` });
+                console.log(`[${config.name}] Compression completed`);
 
                 if (progressCallback) progressCallback(100);
                 resolve();
@@ -2180,75 +2161,27 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
             if (config.processingStrategy === 'manual') {
                 console.log(`[${config.name}] Encoding with manual rate control (${config.rateControl})`);
 
-                const command = ffmpeg(inputPath)
-                    .setStartTime(startTime)
-                    .setDuration(duration)
-                    .output(outputPath)
-                    .videoCodec(videoCodec)
-                    .audioCodec(config.audioCodec)
-                    .format('mp4')
-                    .addOptions(buildStructuredEncodingOptions(config, {}, {
+                const outputOptions = buildStructuredEncodingOptions(config, {}, {
                         hardwareAcceleration,
                         videoCodec
-                    }));
+                    });
 
                 const inputOptions = getHardwareInputOptions(config.videoCodec, hardwareAcceleration);
-                if (inputOptions.length > 0) {
-                    command.inputOptions(inputOptions);
-                }
-
                 const presetOptions = getPresetOptionsForAcceleration(
                     [...(config.options || []), ...(config.extraOptions || [])],
                     hardwareAcceleration,
                     videoCodec
                 );
-                if (presetOptions.length > 0) {
-                    command.addOptions(presetOptions);
-                }
-
-                if (progressCallback) {
-                    command.on('progress', (progress) => {
-                        const rawPercent = getEncodingProgressPercent(progress, duration);
-                        if (rawPercent != null) {
-                            progressCallback(formatProgressPercent(rawPercent));
-                        }
-                    });
-                }
-
-                await new Promise((resolve, reject) => {
-                    let stderrOutput = '';
-                    command
-                        .on('start', (commandLine) => {
-                            console.log(`[${config.name}] FFmpeg command: ${commandLine}`);
-                            if (job) {
-                                setTimeout(() => {
-                                    if (command.ffmpegProc) {
-                                        job.ffmpegProcess = command.ffmpegProc;
-                                    }
-                                }, 100);
-                            }
-                        })
-                        .on('stderr', (line) => {
-                            stderrOutput += `${line}\n`;
-                            if (stderrOutput.length > 12000) {
-                                stderrOutput = stderrOutput.slice(-12000);
-                            }
-                        })
-                        .on('end', () => {
-                            if (job) job.ffmpegProcess = null;
-                            console.log(`[${config.name}] Manual compression completed`);
-                            resolve();
-                        })
-                        .on('error', (err) => {
-                            if (job) job.ffmpegProcess = null;
-                            console.error(`[${config.name}] Manual compression error:`, err);
-                            if (stderrOutput.trim()) {
-                                console.error(`[${config.name}] FFmpeg stderr: ${stderrOutput.trim()}`);
-                            }
-                            reject(err);
-                        })
-                        .run();
-                });
+                outputOptions.push(...presetOptions);
+                await runDirectFfmpeg(buildEncodingArgs(inputPath, outputPath, {
+                    startTime,
+                    duration,
+                    inputOptions,
+                    videoCodec,
+                    audioCodec: config.audioCodec,
+                    outputOptions
+                }), { duration, progressCallback, job, label: `[${config.name}]` });
+                console.log(`[${config.name}] Manual compression completed`);
 
                 if (progressCallback) progressCallback(100);
                 resolve();
@@ -2258,23 +2191,13 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
             // Original mode or fallback for any other modes
             console.log(`[${config.name}] Using standard processing`);
             
-            const command = ffmpeg(inputPath)
-                .setStartTime(startTime)
-                .setDuration(duration)
-                .output(outputPath)
-                .videoCodec(videoCodec)
-                .audioCodec(config.audioCodec)
-                .format('mp4')
-                .addOptions(buildStructuredEncodingOptions(config, {}, {
+            const outputOptions = buildStructuredEncodingOptions(config, {}, {
                     hardwareAcceleration,
                     videoCodec
-                }));
+                });
             
             // Calculate target bitrate for non-original modes
             const inputOptions = getHardwareInputOptions(config.videoCodec, hardwareAcceleration);
-            if (inputOptions.length > 0) {
-                command.inputOptions(inputOptions);
-            }
 
             // Calculate target bitrate for non-original modes
             if (compressionMode !== 'original') {
@@ -2301,7 +2224,7 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                         String(Math.round(targetVideoBitrate * 2))
                     );
                 }
-                command.addOptions(bitrateOptions);
+                outputOptions.push(...bitrateOptions);
             }
             
             // Add compression-specific options
@@ -2310,54 +2233,21 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                 hardwareAcceleration,
                 videoCodec
             );
-            if (presetOptions.length > 0) {
-                command.addOptions(presetOptions);
-            }
-            
-            if (progressCallback) {
-                command.on('progress', (progress) => {
-                    const rawPercent = getEncodingProgressPercent(progress, duration);
-                    if (rawPercent != null) {
-                        const percent = formatProgressPercent(rawPercent);
-                        progressCallback(percent);
-                        console.log(`FFmpeg progress: ${percent}% - ${config.name}`);
-                    }
-                });
-            }
-            
-            let stderrOutput = '';
-            command
-                .on('start', (commandLine) => {
-                    console.log(`[${config.name}] FFmpeg command: ${commandLine}`);
-                    // Store the process reference if job is provided
-                    if (job) {
-                        setTimeout(() => {
-                            if (command.ffmpegProc) {
-                                job.ffmpegProcess = command.ffmpegProc;
-                            }
-                        }, 100);
-                    }
-                })
-                .on('stderr', (line) => {
-                    stderrOutput += `${line}\n`;
-                    if (stderrOutput.length > 12000) {
-                        stderrOutput = stderrOutput.slice(-12000);
-                    }
-                })
-                .on('end', () => {
-                    if (job) job.ffmpegProcess = null;
-                    console.log(`FFmpeg processing completed successfully with ${config.name}`);
-                    resolve();
-                })
-                .on('error', (err) => {
-                    if (job) job.ffmpegProcess = null;
-                    console.error(`FFmpeg error with ${config.name}:`, err);
-                    if (stderrOutput.trim()) {
-                        console.error(`[${config.name}] FFmpeg stderr: ${stderrOutput.trim()}`);
-                    }
-                    reject(err);
-                })
-                .run();
+            outputOptions.push(...presetOptions);
+            const loggedProgress = progressCallback ? (percent) => {
+                progressCallback(percent);
+                console.log(`FFmpeg progress: ${percent}% - ${config.name}`);
+            } : null;
+            await runDirectFfmpeg(buildEncodingArgs(inputPath, outputPath, {
+                startTime,
+                duration,
+                inputOptions,
+                videoCodec,
+                audioCodec: config.audioCodec,
+                outputOptions
+            }), { duration, progressCallback: loggedProgress, job, label: `[${config.name}]` });
+            console.log(`FFmpeg processing completed successfully with ${config.name}`);
+            resolve();
         } catch (error) {
             reject(error);
         }
@@ -2365,24 +2255,17 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
 }
 
 function getPrimaryMediaInfo(inputPath) {
-    return new Promise((resolve, reject) => {
-        ffmpeg.ffprobe(inputPath, (err, metadata) => {
-            if (err) {
-                reject(err);
-                return;
-            }
-
+    return probeMedia(inputPath).then((metadata) => {
             const videoStream = metadata.streams.find((stream) => stream.codec_type === 'video');
             const audioStream = metadata.streams.find((stream) => stream.codec_type === 'audio');
-            resolve({
+            return {
                 videoCodec: videoStream?.codec_name || null,
                 audioCodec: audioStream?.codec_name || null,
                 width: Number(videoStream?.width) || 0,
                 height: Number(videoStream?.height) || 0,
                 frameRate: videoStream?.avg_frame_rate || videoStream?.r_frame_rate || null,
                 hasAudio: Boolean(audioStream)
-            });
-        });
+            };
     });
 }
 
@@ -2604,12 +2487,7 @@ async function combineVideoTracks(tracks, outputPath, compressionMode, progressC
 
         if (compressionMode !== 'original') {
             // Probe the combined file for its duration
-            const duration = await new Promise((resolve, reject) => {
-                ffmpeg.ffprobe(tempCombinedPath, (err, metadata) => {
-                    if (err) reject(err);
-                    else resolve(metadata.format.duration);
-                });
-            });
+            const duration = (await probeMedia(tempCombinedPath)).format.duration;
             // Compress the entire combined file
             // Create wrapper callback that maps compression progress (0-100%) to full range (0-100%)
             const compressionCallback = progressCallback ? (compressionProgress) => {
@@ -2641,8 +2519,13 @@ app.use((error, req, res, next) => {
     
     if (error instanceof multer.MulterError) {
         if (error.code === 'LIMIT_FILE_SIZE') {
-            return res.status(400).json({ error: 'File too large.' });
+            return res.status(413).json({ error: 'File exceeds the 10 GB maximum size.' });
         }
+        return res.status(400).json({ error: error.message });
+    }
+
+    if (error?.statusCode) {
+        return res.status(error.statusCode).json({ error: error.message });
     }
     
     res.status(500).json({ 
@@ -2656,18 +2539,19 @@ async function startServer() {
     try {
         await ensureDirectories();
         
-        app.listen(PORT, () => {
+        app.listen(PORT, HOST, () => {
             console.log('Video Trimmer Server with Compression Modes');
             console.log('========================================================');
-            console.log(`Server running on: http://localhost:${PORT}`);
-            console.log(`Health check: http://localhost:${PORT}/health`);
-            console.log(`Server info: http://localhost:${PORT}/info`);
-            console.log(`Compression modes: http://localhost:${PORT}/compression-modes`);
+            console.log(`Server running on: http://${HOST}:${PORT}`);
+            console.log(`Health check: http://${HOST}:${PORT}/health`);
             console.log('========================================================');
             console.log('Ready to process videos with compression!');
             console.log(`Available compression modes: ${Object.keys(COMPRESSION_MODES).length}`);
             console.log('ALL video processing is asynchronous');
             console.log('Automatic cleanup every 30 minutes');
+            if (!process.env.VIDEO_TRIMMER_AUTH_TOKEN) {
+                console.log(`Development API token: ${API_TOKEN}`);
+            }
         });
     } catch (error) {
         console.error('❌ Failed to start server:', error);

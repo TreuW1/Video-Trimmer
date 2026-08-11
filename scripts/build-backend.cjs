@@ -10,9 +10,7 @@ const entryDependencies = [
   'compression',
   'cors',
   'express',
-  'fluent-ffmpeg',
-  'multer',
-  'uuid'
+  'multer'
 ];
 
 function removeDir(dir) {
@@ -76,6 +74,8 @@ function collectDependencies(packageName, seen = new Set()) {
 removeDir(distDir);
 fs.mkdirSync(targetNodeModules, { recursive: true });
 fs.copyFileSync(path.join(rootDir, 'server.cjs'), path.join(distDir, 'server.cjs'));
+fs.copyFileSync(path.join(rootDir, 'update-check.cjs'), path.join(distDir, 'update-check.cjs'));
+fs.copyFileSync(path.join(rootDir, 'VERSION'), path.join(distDir, 'VERSION'));
 fs.copyFileSync(path.join(rootDir, 'upload-limits.json'), path.join(distDir, 'upload-limits.json'));
 fs.copyFileSync(path.join(rootDir, 'compression-presets.json'), path.join(distDir, 'compression-presets.json'));
 

@@ -44,12 +44,15 @@ After its done its job you can either open the file location on keep on editing.
 Every changed track that is located in the library will remember the state it was left in, and update the preview as well as thumbnail, when re-opening said video it will open in the exact state if was left in.
 
 Add track, Change video; 
-favorite one of options to instantly do said action when pressing the button, or just expand and press on it 
+Favorite one of options to instantly do said action when pressing the button, or just expand and press on it.
 
 <img width="220" height="119" alt="image" src="https://github.com/user-attachments/assets/5bbd175d-0b99-4621-a5c5-085774046288" />
 
 Go back to library (ctrl + 1) or remove tracks by pressing X right next to every track so start from 0.
 
+If your ouput folder is set to default the trimmed videos will be deleted after 1day, only if the application is open and the file time reaches it.
+
+Every track can be moved around to set your correct order, by dragging it while holding the 2 vertical lines, inbetween the white check box and Track number.
 
 
 

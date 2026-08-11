@@ -4,7 +4,8 @@ This guide will help you install all dependencies needed to run the Video Editor
 
 ## Installation Steps
 
-Download and install the latest release or:
+Download and install the latest release, as well as FFmpeg (step 4, or download from official website) and set it to your system PATH
+or:
 
 ### Step 1: Install System Dependencies
 
@@ -67,20 +68,9 @@ powershell -ExecutionPolicy Bypass -File ./install-dependencies.ps1
 
 ```powershell
 # Build mode (exe file)
-npn run tauri build
+npm run tauri build
 
 Wait for the build to complete, can take a few minutes.
 When the compiler finishes locate:
-trimmer\src-tauri\target\x86_64-pc-windows-gnu\release\bundle\nsis\VideoTrimmer_0.1.0_x64-setup.exe
+trimmer\src-tauri\target\x86_64-pc-windows-gnu\release\bundle\nsis\VideoTrimmer_1.0.0_x64-setup.exe
 Install to desired location.
-
-
-(skip, large size)
-
-```powershell
-# Development mode (web + server)
-npm run dev
-
-# Or for Tauri desktop app
-npm run tauri:dev:win
-```

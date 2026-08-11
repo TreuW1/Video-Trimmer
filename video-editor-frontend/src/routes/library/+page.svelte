@@ -386,13 +386,8 @@
     }
     
     try {
-      // @ts-ignore - Tauri API
-      const { open } = await import('@tauri-apps/plugin-dialog');
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: 'Select Video Library Folder'
-      });
+      const { invoke } = await import('@tauri-apps/api/core');
+      const selected = await invoke<string | null>('pick_library_directory');
       
       if (selected) {
         selectedDirectory = selected as string;
@@ -1277,7 +1272,16 @@
         isTauri = await checkTauri();
         console.log('Running in Tauri:', isTauri);
         if (isTauri && selectedDirectory) {
-          await startLibraryDirectoryWatcher(selectedDirectory);
+          const { invoke } = await import('@tauri-apps/api/core');
+          const authorized = await invoke<boolean>('is_path_authorized', { path: selectedDirectory });
+          if (authorized) {
+            await startLibraryDirectoryWatcher(selectedDirectory);
+          } else {
+            selectedDirectory = '';
+            videos = [];
+            localStorage.removeItem(CACHE_KEY);
+            updateFilteredVideos();
+          }
         }
       } catch {
         isTauri = false;

@@ -1,10 +1,10 @@
 [package]
 name = "VideoTrimmer"
-version = "0.1.0"
+version = "1.0.0"
 description = "VideoTrimmer"
-authors = ["you"]
-license = ""
-repository = ""
+authors = ["TreuW1"]
+license = "MIT"
+repository = "https://github.com/TreuW1/Video-Trimmer"
 edition = "2021"
 rust-version = "1.77.2"
 
@@ -13,14 +13,16 @@ rust-version = "1.77.2"
 opt-level = "z"      # Optimize for size
 lto = true            # Link-time optimization
 codegen-units = 1     # Better optimization (slower compile)
-strip = true          # Strip symbols (reduces size significantly)
+strip = false         # Tauri patches bundle metadata into the finished binary
 panic = "abort"       # Smaller binary (no unwinding code)
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
 name = "app_lib"    
-crate-type = ["staticlib", "cdylib", "rlib"]
+# The desktop executable links this Rust library directly. Mobile-only
+# static/dynamic library outputs can overflow MinGW's PE export table.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.1", features = [] }
@@ -29,6 +31,7 @@ tauri-build = { version = "2.5.1", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+getrandom = "0.3"
 tauri = { version = "2.9.2", features = ["protocol-asset"] }
 tauri-plugin-log = "2"
 tauri-plugin-opener = { git = "https://github.com/tauri-apps/plugins-workspace", branch = "v2" }

@@ -1,29 +1,65 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { API_BASE, apiFetch } from '$lib/backendApi';
+  import appPackage from '../../../../package.json';
   import DropdownSetting from './DropdownSetting.svelte';
+
+  type UpdateResult = {
+    currentVersion: string;
+    latestVersion: string;
+    updateAvailable: boolean;
+    releaseUrl: string;
+    releaseName: string;
+    publishedAt: string | null;
+  };
 
   let {
     outputDirectory,
     generateOutputFilename,
     hardwareAccelerationEnabled,
+    popupNotificationsEnabled,
     chooseOutputDirectory,
     clearOutputDirectory,
     setGenerateOutputFilename,
     setHardwareAccelerationEnabled,
+    setPopupNotificationsEnabled,
     openCompressionPresetModal
   }: {
     outputDirectory: string;
     generateOutputFilename: boolean;
     hardwareAccelerationEnabled: boolean;
+    popupNotificationsEnabled: boolean;
     chooseOutputDirectory: () => void;
     clearOutputDirectory: () => void;
     setGenerateOutputFilename: (enabled: boolean) => void;
     setHardwareAccelerationEnabled: (enabled: boolean) => void;
+    setPopupNotificationsEnabled: (enabled: boolean) => void;
     openCompressionPresetModal: () => void;
   } = $props();
 
   let isOpen = $state(false);
   let rootElement = $state<HTMLElement | null>(null);
+  let updateState = $state<'idle' | 'checking' | 'current' | 'available' | 'error'>('idle');
+  let updateResult = $state<UpdateResult | null>(null);
+  let updateError = $state('');
+
+  async function checkForUpdates(): Promise<void> {
+    updateState = 'checking';
+    updateResult = null;
+    updateError = '';
+
+    try {
+      const response = await apiFetch(`${API_BASE}/update-check`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Could not check for updates.');
+
+      updateResult = data as UpdateResult;
+      updateState = updateResult.updateAvailable ? 'available' : 'current';
+    } catch (error) {
+      updateError = error instanceof Error ? error.message : 'Could not check for updates.';
+      updateState = 'error';
+    }
+  }
 
   onMount(() => {
     const handleDocumentClick = (event: MouseEvent) => {
@@ -117,6 +153,33 @@
       </DropdownSetting>
 
       <DropdownSetting
+        title="Pop-up notifications"
+        value={popupNotificationsEnabled ? 'Enabled' : 'Disabled'}
+        description="Show status messages and upload progress over the editor."
+      >
+        <label class="flex cursor-pointer items-center justify-between gap-4 rounded-lg border border-gray-700/40 bg-gray-800/40 p-3">
+          <span class="min-w-0">
+            <span class="block text-sm font-medium text-slate-200">Editor pop-ups</span>
+            <span class="mt-1 block text-xs text-slate-500">
+              Includes confirmations, errors, and the upload queue.
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            class="peer sr-only"
+            checked={popupNotificationsEnabled}
+            onchange={(event) => {
+              setPopupNotificationsEnabled((event.currentTarget as HTMLInputElement).checked);
+            }}
+          />
+          <span
+            class="relative h-6 w-11 shrink-0 rounded-full bg-gray-700 transition-colors after:absolute after:left-1 after:top-1 after:h-4 after:w-4 after:rounded-full after:bg-white after:transition-transform peer-checked:bg-slate-500 peer-checked:after:translate-x-5"
+            aria-hidden="true"
+          ></span>
+        </label>
+      </DropdownSetting>
+
+      <DropdownSetting
         title="Hardware acceleration"
         value={hardwareAccelerationEnabled ? 'Enabled' : 'Disabled'}
         description="Use GPU encoding when supported."
@@ -141,6 +204,45 @@
             aria-hidden="true"
           ></span>
         </label>
+      </DropdownSetting>
+
+      <DropdownSetting
+        title="Updates"
+        value={`Version ${appPackage.version}`}
+        description="Check GitHub for a newer published release."
+      >
+        <div class="space-y-2" aria-live="polite">
+          <button
+            type="button"
+            onclick={checkForUpdates}
+            disabled={updateState === 'checking'}
+            class="w-full rounded-lg border border-slate-500/40 bg-slate-700/50 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-slate-600/60 disabled:cursor-wait disabled:opacity-60"
+          >
+            {updateState === 'checking' ? 'Checking…' : 'Check for updates'}
+          </button>
+
+          {#if updateState === 'available' && updateResult}
+            <div class="rounded-lg border border-emerald-700/40 bg-emerald-950/30 p-3 text-xs text-emerald-200">
+              <p>Version {updateResult.latestVersion} is available.</p>
+              <a
+                href={updateResult.releaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                class="mt-2 inline-block font-medium text-emerald-300 underline decoration-emerald-600 underline-offset-2 hover:text-emerald-200"
+              >
+                View release and download
+              </a>
+            </div>
+          {:else if updateState === 'current' && updateResult}
+            <p class="rounded-lg border border-gray-700/40 bg-gray-800/40 p-3 text-xs text-slate-300">
+              You're up to date. The latest release is version {updateResult.latestVersion}.
+            </p>
+          {:else if updateState === 'error'}
+            <p class="rounded-lg border border-red-800/40 bg-red-950/30 p-3 text-xs text-red-300">
+              {updateError}
+            </p>
+          {/if}
+        </div>
       </DropdownSetting>
     </div>
   {/if}

@@ -1,3 +1,37 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 @plugin '@tailwindcss/typography';
+
+.trimmer-scrollbar,
+.trimmer-scrollbar * {
+  scrollbar-color: #475569 #111827;
+  scrollbar-width: thin;
+}
+
+.trimmer-scrollbar::-webkit-scrollbar,
+.trimmer-scrollbar *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.trimmer-scrollbar::-webkit-scrollbar-track,
+.trimmer-scrollbar *::-webkit-scrollbar-track {
+  background: #111827;
+}
+
+.trimmer-scrollbar::-webkit-scrollbar-thumb,
+.trimmer-scrollbar *::-webkit-scrollbar-thumb {
+  background: #475569;
+  border: 2px solid #111827;
+  border-radius: 9999px;
+}
+
+.trimmer-scrollbar::-webkit-scrollbar-thumb:hover,
+.trimmer-scrollbar *::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+.trimmer-scrollbar::-webkit-scrollbar-corner,
+.trimmer-scrollbar *::-webkit-scrollbar-corner {
+  background: #111827;
+}

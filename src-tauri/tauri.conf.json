@@ -1,12 +1,12 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "VideoTrimmer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "identifier": "com.videoeditor",
   "build": {
     "frontendDist": "../video-editor-frontend/build",
     "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run dev --prefix video-editor-frontend",
     "beforeBuildCommand": "npm run build:backend && npm run build"
   },
   "app": {
@@ -26,13 +26,12 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://localhost:3000; media-src 'self' asset: https://asset.localhost http://asset.localhost blob: data: http://localhost:3000 tauri: https://tauri.localhost; img-src 'self' asset: https://asset.localhost http://asset.localhost data: blob: tauri: https://tauri.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://127.0.0.1:3000; media-src 'self' asset: https://asset.localhost http://asset.localhost blob: data: http://127.0.0.1:3000 tauri: https://tauri.localhost; img-src 'self' asset: https://asset.localhost http://asset.localhost data: blob: tauri: https://tauri.localhost; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';",
       "assetProtocol": {
         "enable": true,
         "scope": [
           "$APPDATA/**",
-          "$APPCACHE/**",
-          "**"
+          "$APPCACHE/**"
         ]
       }
     }
@@ -49,9 +48,14 @@
     ],
     "resources": {
       "backend-dist": "backend-dist",
-      "target/x86_64-pc-windows-gnu/release/WebView2Loader.dll": "WebView2Loader.dll"
+      "../LICENSE": "LICENSE.txt",
+      "../THIRD_PARTY_LICENSES.txt": "THIRD_PARTY_LICENSES.txt",
+      "../licenses/NODE_LICENSE.txt": "NODE_LICENSE.txt",
+      "resources/WebView2Loader.dll": "WebView2Loader.dll"
     },
-    "copyright": "",
+    "copyright": "Copyright © 2026 TreuW1",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
     "category": "Utility",
     "shortDescription": "Video Trimmer",
     "longDescription": "Video Trimmer Application",

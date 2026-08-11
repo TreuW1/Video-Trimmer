@@ -14,7 +14,7 @@
       <span class="text-xs text-slate-400">{completedCount}/{uploadQueue.length}</span>
     </div>
 
-    <div class="space-y-2 max-h-64 overflow-y-auto">
+    <div class="trimmer-scrollbar space-y-2 max-h-64 overflow-y-auto">
       {#each uploadQueue as item (item.trackId)}
         <div class="bg-gray-800/50 rounded-lg p-2 border border-gray-700/30">
           <div class="flex items-center gap-2">

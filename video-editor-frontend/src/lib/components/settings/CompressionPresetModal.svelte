@@ -181,7 +181,7 @@
         <button type="button" class="rounded-md px-2 py-1 text-sm text-slate-300 hover:bg-gray-800" onclick={onClose}>Close</button>
       </div>
 
-      <div class="max-h-[75vh] overflow-auto p-5">
+      <div class="trimmer-scrollbar max-h-[75vh] overflow-auto p-5">
         <div class="grid gap-4 md:grid-cols-2">
           <label class="block">
             <span class="mb-1 block text-xs font-medium uppercase text-slate-400">Name</span>

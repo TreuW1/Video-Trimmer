@@ -1,0 +1,47 @@
+{
+  "name": "trimmer",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "version": "1.0.0",
+  "dependencies": {
+    "compression": "1.8.1",
+    "cors": "2.8.6",
+    "express": "5.2.1",
+    "multer": "2.2.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  },
+  "overrides": {
+    "path-to-regexp": "8.4.0"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.cjs",
+    "dev": "node scripts/dev.cjs",
+    "build": "npm run build --prefix video-editor-frontend",
+    "build:backend": "npm run licenses:generate && node scripts/build-backend.cjs",
+    "licenses:generate": "node scripts/generate-third-party-licenses.cjs",
+    "preview": "npm run preview --prefix video-editor-frontend",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:dev:win": "powershell -ExecutionPolicy Bypass -File ./run-tauri-dev.ps1",
+    "tauri:build:win": "powershell -ExecutionPolicy Bypass -File ./run-tauri-build.ps1",
+    "check:requirements": "powershell -ExecutionPolicy Bypass -File ./install-dependencies.ps1",
+    "install:deps": "powershell -ExecutionPolicy Bypass -File ./install-dependencies.ps1",
+    "clean:build": "powershell -ExecutionPolicy Bypass -File ./clean-build.ps1",
+    "version": "node update-version.js",
+    "version:patch": "node -e \"const fs=require('fs');const v=fs.readFileSync('VERSION','utf-8').trim().split('.');v[2]++;fs.writeFileSync('VERSION',v.join('.'));\" && node update-version.js",
+    "version:minor": "node -e \"const fs=require('fs');const v=fs.readFileSync('VERSION','utf-8').trim().split('.');v[1]++;v[2]=0;fs.writeFileSync('VERSION',v.join('.'));\" && node update-version.js",
+    "version:major": "node -e \"const fs=require('fs');const v=fs.readFileSync('VERSION','utf-8').trim().split('.');v[0]++;v[1]=0;v[2]=0;fs.writeFileSync('VERSION',v.join('.'));\" && node update-version.js"
+  },
+  "nodemonConfig": {
+    "ignore": [
+      "custom-compression-presets.json",
+      "uploads/**",
+      "outputs/**",
+      "temp/**"
+    ]
+  }
+}

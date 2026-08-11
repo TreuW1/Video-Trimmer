@@ -10,6 +10,7 @@ dist/
 *.exe
 *.dll
 *.pdb
+!src-tauri/resources/WebView2Loader.dll
 
 # Tauri build outputs
 src-tauri/target/
@@ -65,10 +66,10 @@ vite.config.ts.timestamp-*
 # Cargo
 **/target/
 **/Cargo.lock
+!src-tauri/Cargo.lock
 
-# Local setup scripts and root package manifest
+# Local setup scripts
 *.ps
 *.ps1
-/package.json
 start-app.bat
-
+update-version.js

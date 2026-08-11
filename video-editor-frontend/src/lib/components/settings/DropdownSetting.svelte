@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
+  import { untrack, type Snippet } from 'svelte';
 
   let {
     title,
@@ -17,7 +17,7 @@
     children?: Snippet;
   } = $props();
 
-  let isOpen = $state(initiallyOpen);
+  let isOpen = $state(untrack(() => initiallyOpen));
   let contentId = $derived(`setting-${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`);
   let displayValue = $derived(value?.trim() || fallbackValue);
 </script>
