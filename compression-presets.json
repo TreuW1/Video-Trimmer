@@ -16,12 +16,10 @@
     "processingStrategy": "bitrateTarget",
     "videoCodec": "libx265",
     "audioCodec": "aac",
-    "options": [
-      "-preset medium",
-      "-movflags faststart",
-      "-profile:v main",
-      "-level 4.0"
-    ],
+    "options": [],
+    "encoderPreset": "medium",
+    "profile": "main",
+    "level": "4.0",
     "targetSizePercent": 40,
     "estimatedTime": "Medium",
     "qualityLevel": "High"
@@ -33,12 +31,10 @@
     "processingStrategy": "bitrateTarget",
     "videoCodec": "libx265",
     "audioCodec": "aac",
-    "options": [
-      "-preset medium",
-      "-movflags faststart",
-      "-profile:v main",
-      "-level 4.2"
-    ],
+    "options": [],
+    "encoderPreset": "medium",
+    "profile": "main",
+    "level": "4.2",
     "targetSizePercent": 60,
     "estimatedTime": "Slow",
     "qualityLevel": "Very High"
@@ -50,12 +46,10 @@
     "processingStrategy": "sizeTarget",
     "videoCodec": "libx265",
     "audioCodec": "aac",
-    "options": [
-      "-preset slow",
-      "-movflags faststart",
-      "-profile:v main",
-      "-level 4.0"
-    ],
+    "options": [],
+    "encoderPreset": "slow",
+    "profile": "main",
+    "level": "4.0",
     "targetSizeMB": 9.5,
     "sizeLimitMB": 10,
     "sizeLabel": "~10 MB",
@@ -69,12 +63,10 @@
     "processingStrategy": "sizeTarget",
     "videoCodec": "libx265",
     "audioCodec": "aac",
-    "options": [
-      "-preset slow",
-      "-movflags faststart",
-      "-profile:v main",
-      "-level 4.1"
-    ],
+    "options": [],
+    "encoderPreset": "slow",
+    "profile": "main",
+    "level": "4.1",
     "targetSizeMB": 45,
     "sizeLimitMB": 50,
     "sizeLabel": "~50 MB",
@@ -88,12 +80,10 @@
     "processingStrategy": "sizeTarget",
     "videoCodec": "libx265",
     "audioCodec": "aac",
-    "options": [
-      "-preset slow",
-      "-movflags faststart",
-      "-profile:v high",
-      "-level 4.1"
-    ],
+    "options": [],
+    "encoderPreset": "slow",
+    "profile": "high",
+    "level": "4.1",
     "targetSizeMB": 90,
     "sizeLimitMB": 100,
     "sizeLabel": "~100 MB",

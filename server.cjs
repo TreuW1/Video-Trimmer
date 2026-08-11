@@ -7,7 +7,9 @@ const fsSync = require('fs');
 const cors = require('cors');
 const { spawn } = require('child_process');
 const compression = require('compression');
-const builtInCompressionPresets = require('./compression-presets.json');
+const builtInCompressionPresets = process.env.VIDEO_TRIMMER_BUILT_IN_COMPRESSION_PRESETS
+    ? JSON.parse(process.env.VIDEO_TRIMMER_BUILT_IN_COMPRESSION_PRESETS)
+    : require('./compression-presets.json');
 const { checkForUpdate } = require('./update-check.cjs');
 
 const app = express();

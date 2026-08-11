@@ -207,8 +207,8 @@
           <label class="block">
             <span class="mb-1 block text-xs font-medium uppercase text-slate-400">Video codec</span>
             <select class="w-full rounded-md border-gray-700 bg-gray-900 text-sm text-white" value={draft.videoCodec} onchange={(event) => applyVideoCodec((event.currentTarget as HTMLSelectElement).value)}>
-              <option value="libx265">H.265 / HEVC</option>
               <option value="libx264">H.264 / AVC</option>
+              <option value="libx265">H.265 / HEVC</option>
               <option value="libsvtav1">AV1 / SVT-AV1</option>
               <option value="libaom-av1">AV1 / libaom</option>
               <option value="libaom-av2">AV2 / experimental</option>

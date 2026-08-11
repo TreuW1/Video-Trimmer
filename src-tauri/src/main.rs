@@ -15,6 +15,10 @@ use tauri_plugin_prevent_default::{self as prevent_default, Flags, PlatformOptio
 
 const LIBRARY_VIDEO_EXTENSIONS: [&str; 8] =
     ["mp4", "avi", "mov", "mkv", "webm", "flv", "wmv", "m4v"];
+const BUILT_IN_COMPRESSION_PRESETS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../compression-presets.json"
+));
 
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -714,6 +718,10 @@ fn start_backend_server(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error
         .env("VIDEO_TRIMMER_DATA_DIR", &app_data_dir)
         .env("VIDEO_TRIMMER_AUTH_TOKEN", &security.auth_token)
         .env("VIDEO_TRIMMER_SCOPES_FILE", &security.scopes_file)
+        .env(
+            "VIDEO_TRIMMER_BUILT_IN_COMPRESSION_PRESETS",
+            BUILT_IN_COMPRESSION_PRESETS,
+        )
         .stdout(Stdio::from(stdout_log))
         .stderr(Stdio::from(stderr_log))
         .stdin(Stdio::null());
