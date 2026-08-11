@@ -54,5 +54,8 @@ If your ouput folder is set to default the trimmed videos will be deleted after 
 
 Every track can be moved around to set your correct order, by dragging it while holding the 2 vertical lines, inbetween the white check box and Track number.
 
+File size upload limit is 10GB.
+
+Check for updates setting checks (when pressed not automatic) if there are newer releases, and it will prompt you to this Github page to download it manually.
 
 
