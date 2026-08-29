@@ -3,6 +3,7 @@
 ## About
 VideoTrimmer is a desktop video trimming and compression application built with
 Tauri, Svelte and Node.js, designed for short form clips. See [INSTALL.md](INSTALL.md) for development and build setup.
+Please open up Issues if you have any suggestions as to what should be changed or added as a new feature.
 
 ## Usage
 
@@ -14,7 +15,8 @@ Clicking on any of these videos will send them directly to the Trimmer part of a
 
 Upon being sent to the Trimmer you will welcome this screen:
 
-<img width="1885" height="962" alt="image" src="https://github.com/user-attachments/assets/748d73f1-c882-4fce-b5aa-1ba7a7559cf6" />
+<img width="1892" height="954" alt="image" src="https://github.com/user-attachments/assets/46c23e83-5e72-484d-9ee0-843e3f5fe61a" />
+
 
 On the left will end up the videos you selected, clicking on white boxes will let you combine all tracks which boxes are selected. Each track opens their own player where you set Start and End time using the side bars, or by Pressing (S) - Start, (E) End based on the current time indicator (red timestamp)
 
@@ -27,7 +29,8 @@ After doing so you can select your compression mode -> manage
 
 There are a few "Guide" modes which you can hide or show at will, as well as possibilty to create customs presets
 
-<img width="749" height="800" alt="image" src="https://github.com/user-attachments/assets/c7b3dbf3-61be-4de1-b779-d8f0fb20369d" />
+<img width="746" height="872" alt="image" src="https://github.com/user-attachments/assets/77bd4b05-a271-4da0-ace7-bfe0ee68bd81" />
+
 
 There are a few Rate control options such as, Target MB, percent reduction or constant bitrate, together with multiple video codecs.
 When using the MB mode i generally recommend setting your LIMIT for example to 25mb, while the TARGET to few MB less, for example 23. To reduce the risk of overshooting, which will make the video re-encode again.
