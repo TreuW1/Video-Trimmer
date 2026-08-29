@@ -1,6 +1,6 @@
 [package]
 name = "VideoTrimmer"
-version = "1.0.0"
+version = "1.0.5"
 description = "VideoTrimmer"
 authors = ["TreuW1"]
 license = "MIT"
@@ -39,4 +39,12 @@ tauri-plugin-shell = { git = "https://github.com/tauri-apps/plugins-workspace", 
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = { version = "2", features = ["watch"] }
 tauri-plugin-prevent-default = { version = "4", features = ["platform-windows"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
     

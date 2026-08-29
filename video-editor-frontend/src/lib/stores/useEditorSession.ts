@@ -13,7 +13,10 @@ type EditorSession = {
 let editorSession: EditorSession | null = null;
 
 function copyTrack(track: VideoTrack): VideoTrack {
-  return { ...track };
+  return {
+    ...track,
+    audioMuteRanges: track.audioMuteRanges?.map((range) => ({ ...range }))
+  };
 }
 
 function copyQueueItem(item: UploadQueueItem): UploadQueueItem {

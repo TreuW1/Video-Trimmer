@@ -4,6 +4,7 @@
     outputDirectory,
     outputFilename,
     generateOutputFilename,
+    outputExtension = 'mp4',
     error = '',
     onChooseDirectory,
     onFilenameChange,
@@ -15,6 +16,7 @@
     outputDirectory: string;
     outputFilename: string;
     generateOutputFilename: boolean;
+    outputExtension?: 'mp4' | 'm4a';
     error?: string;
     onChooseDirectory: () => void;
     onFilenameChange: (filename: string) => void;
@@ -28,7 +30,7 @@
   <div class="fixed inset-0 z-50 flex items-center justify-center bg-gray-950/90 p-4 backdrop-blur-md">
     <div class="w-full max-w-lg rounded-2xl border border-gray-400/20 bg-gradient-to-b from-gray-900 to-gray-800 p-6 shadow-2xl">
       <h2 class="text-xl font-semibold text-white">Choose output</h2>
-      <p class="mt-1 text-sm text-slate-400">Select where this trimmed video will be saved and set its file name.</p>
+      <p class="mt-1 text-sm text-slate-400">Select where this trimmed {outputExtension === 'm4a' ? 'audio' : 'video'} will be saved and set its file name.</p>
 
       <div class="mt-5 space-y-4">
         <div class:opacity-50={generateOutputFilename}>
@@ -58,11 +60,11 @@
             value={outputFilename}
             oninput={(event) => onFilenameChange(event.currentTarget.value)}
             disabled={generateOutputFilename}
-            placeholder="trimmed-video.mp4"
+            placeholder={outputExtension === 'm4a' ? 'trimmed-audio.m4a' : 'trimmed-video.mp4'}
             autocomplete="off"
             class="w-full rounded-lg border border-gray-600/60 bg-gray-950/50 px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:border-slate-400 focus:outline-none"
           />
-          <p class="mt-1 text-xs text-slate-500">MP4 is added automatically if you leave off the extension.</p>
+          <p class="mt-1 text-xs text-slate-500">{outputExtension.toUpperCase()} is added automatically if you leave off the extension.</p>
         </div>
 
         <label class="flex cursor-pointer items-start gap-3 rounded-lg border border-gray-700/50 bg-gray-950/30 p-3">
@@ -96,7 +98,7 @@
           onclick={onConfirm}
           class="rounded-lg bg-slate-600 px-4 py-2 text-sm font-medium text-white shadow-md transition-colors hover:bg-slate-500"
         >
-          Start trimming
+          {outputExtension === 'm4a' ? 'Start extraction' : 'Start trimming'}
         </button>
       </div>
     </div>

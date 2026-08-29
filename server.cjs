@@ -13,9 +13,16 @@ const builtInCompressionPresets = process.env.VIDEO_TRIMMER_BUILT_IN_COMPRESSION
 const { checkForUpdate } = require('./update-check.cjs');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const configuredPort = Number.parseInt(process.env.PORT, 10);
+const PORT = Number.isSafeInteger(configuredPort) && configuredPort > 0 && configuredPort <= 65535
+    ? configuredPort
+    : 3000;
 const HOST = '127.0.0.1';
 const API_TOKEN = process.env.VIDEO_TRIMMER_AUTH_TOKEN || crypto.randomBytes(32).toString('hex');
+const configuredParentPid = Number.parseInt(process.env.VIDEO_TRIMMER_PARENT_PID, 10);
+const PARENT_PID = Number.isSafeInteger(configuredParentPid) && configuredParentPid > 0
+    ? configuredParentPid
+    : null;
 const ALLOWED_ORIGINS = new Set(
     (process.env.VIDEO_TRIMMER_ALLOWED_ORIGINS ||
         'http://localhost:5173,http://127.0.0.1:5173,http://tauri.localhost,https://tauri.localhost,tauri://localhost')
@@ -89,6 +96,7 @@ const APP_VERSION = (() => {
 
 // Track uploaded videos
 const uploadedVideos = new Map();
+const waveformCache = new Map();
 
 async function resolveOutputDirectory(outputDirectory) {
     if (typeof outputDirectory !== 'string' || outputDirectory.trim() === '') {
@@ -157,6 +165,74 @@ function probeMedia(inputPath) {
     });
 }
 
+function generateWaveformPeaks(inputPath, duration, pointCount) {
+    return new Promise((resolve, reject) => {
+        const sampleRate = 8000;
+        const expectedSamples = Math.max(1, Math.ceil(duration * sampleRate));
+        const squaredAmplitudeSums = new Float64Array(pointCount);
+        const sampleCounts = new Uint32Array(pointCount);
+        let sampleIndex = 0;
+        let leftover = null;
+        let stderr = '';
+        const child = spawn('ffmpeg', [
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-i', inputPath,
+            '-map', '0:a:0',
+            '-vn',
+            '-ac', '1',
+            '-ar', String(sampleRate),
+            '-c:a', 'pcm_s16le',
+            '-f', 's16le',
+            'pipe:1'
+        ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+
+        child.stdout.on('data', (chunk) => {
+            let data = chunk;
+            if (leftover) {
+                data = Buffer.concat([leftover, chunk]);
+                leftover = null;
+            }
+            if (data.length % 2 !== 0) {
+                leftover = data.subarray(data.length - 1);
+                data = data.subarray(0, data.length - 1);
+            }
+
+            for (let offset = 0; offset < data.length; offset += 2) {
+                const amplitude = Math.abs(data.readInt16LE(offset)) / 32768;
+                const bin = Math.min(pointCount - 1, Math.floor((sampleIndex / expectedSamples) * pointCount));
+                squaredAmplitudeSums[bin] += amplitude * amplitude;
+                sampleCounts[bin]++;
+                sampleIndex++;
+            }
+        });
+        child.stderr.on('data', (chunk) => {
+            stderr = `${stderr}${chunk}`.slice(-12000);
+        });
+        child.on('error', reject);
+        child.on('close', (code) => {
+            if (code !== 0) return reject(new Error(stderr.trim() || `Waveform extraction exited with code ${code}`));
+            // Maxima make most bins look identical on speech and music. RMS
+            // captures the energy in each window; displaying it on a decibel
+            // scale preserves both quiet and loud sections.
+            const rmsValues = Array.from(squaredAmplitudeSums, (sum, index) =>
+                sampleCounts[index] > 0 ? Math.sqrt(sum / sampleCounts[index]) : 0
+            );
+            const audibleLevels = rmsValues.filter((level) => level > 0).sort((a, b) => a - b);
+            const referenceLevel = audibleLevels.length > 0
+                ? audibleLevels[Math.min(audibleLevels.length - 1, Math.floor(audibleLevels.length * 0.95))]
+                : 0;
+            const normalizationLevel = Math.max(referenceLevel, 0.00001);
+            resolve(rmsValues.map((level) => {
+                if (level <= 0) return 0;
+                const decibels = 20 * Math.log10(level / normalizationLevel);
+                const normalized = Math.max(0, Math.min(1, (decibels + 48) / 48));
+                return Math.round(Math.pow(normalized, 0.85) * 1000) / 1000;
+            }));
+        });
+    });
+}
+
 function runDirectFfmpeg(args, { duration = null, progressCallback = null, job = null, label = 'FFmpeg' } = {}) {
     return new Promise((resolve, reject) => {
         const fullArgs = ['-hide_banner', '-y', '-progress', 'pipe:2', '-nostats', ...args];
@@ -208,15 +284,69 @@ function buildEncodingArgs(input, output, {
     return args;
 }
 
-function normalizeOutputFilename(outputFilename, compressionMode) {
+const AUDIO_OUTPUT_MODES = new Set(['keep', 'volume', 'mute', 'extract']);
+
+function normalizeAudioOutputOptions(audioMode, audioVolume) {
+    const mode = AUDIO_OUTPUT_MODES.has(audioMode) ? audioMode : 'keep';
+    const parsedVolume = Number(audioVolume);
+    const volume = Number.isFinite(parsedVolume) && parsedVolume > 0 && parsedVolume <= 1
+        ? parsedVolume
+        : 0.5;
+    return { mode, volume };
+}
+
+function normalizeAudioMuteRanges(ranges, clipStart, clipEnd) {
+    if (!Array.isArray(ranges)) return [];
+
+    const normalized = ranges
+        .map((range) => ({
+            startTime: Number(range?.startTime),
+            endTime: Number(range?.endTime)
+        }))
+        .filter((range) => Number.isFinite(range.startTime) && Number.isFinite(range.endTime))
+        .map((range) => ({
+            startTime: Math.max(clipStart, range.startTime),
+            endTime: Math.min(clipEnd, range.endTime)
+        }))
+        .filter((range) => range.endTime - range.startTime >= 0.001)
+        .sort((left, right) => left.startTime - right.startTime);
+
+    return normalized.reduce((merged, range) => {
+        const previous = merged[merged.length - 1];
+        if (previous && range.startTime <= previous.endTime + 0.001) {
+            previous.endTime = Math.max(previous.endTime, range.endTime);
+        } else {
+            merged.push({ ...range });
+        }
+        return merged;
+    }, []);
+}
+
+function makeRelativeAudioMuteRanges(ranges, clipStart) {
+    return ranges.map((range) => ({
+        startTime: Math.max(0, range.startTime - clipStart),
+        endTime: Math.max(0, range.endTime - clipStart)
+    }));
+}
+
+function buildPartialMuteFilters(ranges) {
+    return ranges.map((range) =>
+        `volume=0:enable='between(t,${range.startTime.toFixed(3)},${range.endTime.toFixed(3)})'`
+    );
+}
+
+function normalizeOutputFilename(outputFilename, compressionMode, audioMode = 'keep') {
+    const extension = audioMode === 'extract' ? '.m4a' : '.mp4';
     if (typeof outputFilename !== 'string' || outputFilename.trim() === '') {
-        return `trimmed_${compressionMode}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}.mp4`;
+        const outputKind = audioMode === 'extract' ? 'audio' : compressionMode;
+        return `trimmed_${outputKind}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}${extension}`;
     }
 
     let normalized = outputFilename.trim();
-    if (!normalized.toLowerCase().endsWith('.mp4')) {
-        normalized += '.mp4';
+    while (/\.(?:mp4|m4a)$/i.test(normalized)) {
+        normalized = normalized.slice(0, -4);
     }
+    normalized += extension;
     if (
         normalized === '.' ||
         normalized === '..' ||
@@ -231,9 +361,9 @@ function normalizeOutputFilename(outputFilename, compressionMode) {
     return normalized;
 }
 
-async function createOutputTarget(outputDirectory, compressionMode, requestedFilename) {
+async function createOutputTarget(outputDirectory, compressionMode, requestedFilename, audioMode = 'keep') {
     const outputDir = await resolveOutputDirectory(outputDirectory);
-    const outputFilename = normalizeOutputFilename(requestedFilename, compressionMode);
+    const outputFilename = normalizeOutputFilename(requestedFilename, compressionMode, audioMode);
     const outputPath = path.join(outputDir, outputFilename);
 
     try {
@@ -295,14 +425,14 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
             if (targetSizeMB !== null) {
                 // Use fixed target size in MB
                 targetFileSizeBytes = targetSizeMB * 1024 * 1024;
-                console.log(`🎯 Using fixed target size: ${targetSizeMB} MB`);
+                console.log(` Using fixed target size: ${targetSizeMB} MB`);
             } else {
                 if (targetSizePercent == null || !Number.isFinite(targetSizePercent)) {
                     throw new Error('targetSizePercent is required when targetSizeMB is not set');
                 }
                 // Percentage of the proportional size of the segment being exported
                 targetFileSizeBytes = segmentSizeBytes * (targetSizePercent / 100);
-                console.log(`🎯 Using percentage-based target size: ${targetSizePercent}% of segment`);
+                console.log(` Using percentage-based target size: ${targetSizePercent}% of segment`);
             }
             
             // Calculate target total bitrate - account for container overhead (~2%)
@@ -326,7 +456,7 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
             
             const finalAudioBitrate = Math.min(audioBitrate, 320000); // Cap audio at 320kbps
             
-            console.log(`📊 Bitrate Calculation Details:`);
+            console.log(`   Bitrate Calculation Details:`);
             console.log(`   Original file size: ${(fileSizeInBytes / (1024 * 1024)).toFixed(2)} MB`);
             console.log(`   Full duration: ${fullDuration.toFixed(2)}s, output segment: ${outputDuration.toFixed(2)}s`);
             console.log(`   Current total bitrate: ${(currentTotalBitrate / 1000).toFixed(0)} kbps`);
@@ -344,7 +474,9 @@ async function calculateTargetBitrate(inputPath, targetSizePercent, duration = n
             };
 }
 
-const DEFAULT_COMPRESSION_MODE = 'balanced';
+const DEFAULT_COMPRESSION_MODE = ['balanced', 'balanced quality']
+    .find((id) => builtInCompressionPresets.some((preset) => preset?.id === id))
+    ?? String(builtInCompressionPresets[0]?.id || 'original');
 const HARDWARE_ACCELERATION_CODEC_MAP = new Map([
     ['h264', 'h264_nvenc'],
     ['libx264', 'h264_nvenc'],
@@ -485,6 +617,7 @@ function normalizeCompressionPreset(preset) {
         pixelFormat: normalizeOptionalString(preset.pixelFormat) || 'yuv420p',
         audioSampleRate,
         audioChannels,
+        alwaysCompress: preset.alwaysCompress === true,
         estimatedTime: preset.estimatedTime,
         qualityLevel: preset.qualityLevel,
         builtIn: Boolean(preset.builtIn)
@@ -983,7 +1116,7 @@ async function cleanupOldFiles() {
 }
 
 // Run cleanup every 30 minutes while server is running
-setInterval(async () => {
+const cleanupInterval = setInterval(async () => {
     try {
         await cleanupOldFiles();
     } catch (error) {
@@ -992,7 +1125,7 @@ setInterval(async () => {
 }, 30 * 60 * 1000); // 30 minutes
 
 // Initial cleanup on server start
-setTimeout(async () => {
+const initialCleanupTimeout = setTimeout(async () => {
     try {
         await cleanupOldFiles();
     } catch (error) {
@@ -1075,6 +1208,7 @@ function compressionModesList() {
         pixelFormat: config.pixelFormat,
         audioSampleRate: config.audioSampleRate,
         audioChannels: config.audioChannels,
+        alwaysCompress: config.alwaysCompress,
         estimatedTime: config.estimatedTime,
         qualityLevel: config.qualityLevel,
         builtIn: config.builtIn
@@ -1424,16 +1558,56 @@ app.post('/upload-from-path', async (req, res) => {
     }
 });
 
+app.get('/waveform/:videoId', async (req, res) => {
+    const videoInfo = uploadedVideos.get(req.params.videoId);
+    if (!videoInfo) {
+        return res.status(404).json({ error: 'Video not found. Please upload the video first.' });
+    }
+
+    const requestedPoints = Number.parseInt(req.query.points, 10);
+    const pointCount = Number.isFinite(requestedPoints)
+        ? Math.max(64, Math.min(1200, requestedPoints))
+        : 480;
+    const cacheKey = `${req.params.videoId}:${pointCount}`;
+    const cached = waveformCache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    try {
+        const metadata = await probeMedia(videoInfo.path);
+        const audioStream = metadata.streams.find((stream) => stream.codec_type === 'audio');
+        const duration = Number(metadata.format.duration) || 0;
+        if (!audioStream || duration <= 0) {
+            const result = { hasAudio: false, duration, peaks: [] };
+            waveformCache.set(cacheKey, result);
+            return res.json(result);
+        }
+
+        const peaks = await generateWaveformPeaks(videoInfo.path, duration, pointCount);
+        const result = { hasAudio: true, duration, peaks };
+        waveformCache.set(cacheKey, result);
+        return res.json(result);
+    } catch (error) {
+        console.error('Waveform endpoint error:', error);
+        return res.status(500).json({ error: 'Could not generate the audio waveform', message: error.message });
+    }
+});
+
 // Modified trim endpoint to use videoId
 app.post('/trim', express.json(), async (req, res) => {
     try {
         const { videoId, startTime, endTime, compressionMode = DEFAULT_COMPRESSION_MODE, tracks, outputDirectory, outputFilename } = req.body;
         const hardwareAcceleration = req.body.hardwareAcceleration === true;
+        const { mode: audioMode, volume: audioVolume } = normalizeAudioOutputOptions(
+            req.body.audioMode ?? req.body.audioOutputMode,
+            req.body.audioVolume ?? req.body.outputAudioVolume
+        );
+        const processingCompressionMode = audioMode === 'extract' ? 'original' : compressionMode;
         
         // Multi-track support
         if (Array.isArray(tracks) && tracks.length > 1) {
+            const combinedCompressionMode = compressionMode;
             // Validate compression mode
-            if (!COMPRESSION_MODES[compressionMode]) {
+            if (!COMPRESSION_MODES[combinedCompressionMode]) {
                 return res.status(400).json({ 
                     error: 'Invalid compression mode',
                     availableModes: Object.keys(COMPRESSION_MODES)
@@ -1455,11 +1629,17 @@ app.post('/trim', express.json(), async (req, res) => {
                 jobTracks.push({
                     inputPath: videoInfo.path,
                     startTime: t.startTime,
-                    endTime: t.endTime
+                    endTime: t.endTime,
+                    // Audio extraction is a single-clip output mode. In a
+                    // combined video it means "keep this clip's audio".
+                    audioMode: normalizeAudioOutputOptions(t.audioMode ?? t.audioOutputMode).mode === 'mute'
+                        ? 'mute'
+                        : 'keep',
+                    audioMuteRanges: normalizeAudioMuteRanges(t.audioMuteRanges, t.startTime, t.endTime)
                 });
             }
-            const outputTarget = await createOutputTarget(outputDirectory, compressionMode, outputFilename);
-            const compressionConfig = COMPRESSION_MODES[compressionMode];
+            const outputTarget = await createOutputTarget(outputDirectory, combinedCompressionMode, outputFilename, 'keep');
+            const compressionConfig = COMPRESSION_MODES[combinedCompressionMode];
             const jobId = crypto.randomUUID();
             const createdAt = new Date();
             jobs.set(jobId, {
@@ -1469,9 +1649,12 @@ app.post('/trim', express.json(), async (req, res) => {
                 outputPath: outputTarget.outputPath,
                 outputFilename: outputTarget.outputFilename,
                 outputDirectory: outputTarget.outputDirectory,
-                compressionMode: compressionMode,
+                compressionMode: combinedCompressionMode,
                 compressionName: compressionConfig.name,
                 hardwareAcceleration,
+                audioMode: 'keep',
+                audioVolume,
+                workingOutputPath: outputTarget.outputPath,
                 progress: 0,
                 progressMessage: 'Starting...',
                 createdAt: createdAt,
@@ -1482,9 +1665,12 @@ app.post('/trim', express.json(), async (req, res) => {
                 jobId,
                 status: 'processing',
                 message: 'Combining and processing tracks',
-                compressionMode: compressionMode,
+                compressionMode: combinedCompressionMode,
                 compressionName: compressionConfig.name,
                 hardwareAcceleration,
+                audioMode: 'keep',
+                audioVolume,
+                ignoredAudioMode: audioMode === 'extract' ? 'extract' : null,
                 estimatedTime: compressionConfig.estimatedTime,
                 qualityLevel: compressionConfig.qualityLevel
             });
@@ -1505,7 +1691,7 @@ app.post('/trim', express.json(), async (req, res) => {
         }
 
         // Validate compression mode
-        if (!COMPRESSION_MODES[compressionMode]) {
+        if (!COMPRESSION_MODES[processingCompressionMode]) {
             return res.status(400).json({ 
                 error: 'Invalid compression mode',
                 availableModes: Object.keys(COMPRESSION_MODES)
@@ -1523,12 +1709,11 @@ app.post('/trim', express.json(), async (req, res) => {
             return res.status(400).json({ error: 'Start time must be less than end time' });
         }
 
-        const outputTarget = await createOutputTarget(outputDirectory, compressionMode, outputFilename);
-        
-        const compressionConfig = COMPRESSION_MODES[compressionMode];
-
         // Create a job ID for async processing
         const jobId = crypto.randomUUID();
+        const outputTarget = await createOutputTarget(outputDirectory, processingCompressionMode, outputFilename, audioMode);
+        const compressionConfig = COMPRESSION_MODES[processingCompressionMode];
+        const audioMuteRanges = normalizeAudioMuteRanges(req.body.audioMuteRanges, startSeconds, endSeconds);
         
         const createdAt = new Date();
         jobs.set(jobId, {
@@ -1542,9 +1727,15 @@ app.post('/trim', express.json(), async (req, res) => {
             inputSize: videoInfo.size,
             startTime: startSeconds,
             endTime: endSeconds,
-            compressionMode: compressionMode,
-            compressionName: compressionConfig.name,
-            hardwareAcceleration,
+            compressionMode: processingCompressionMode,
+            compressionName: audioMode === 'extract' ? 'Audio extraction' : compressionConfig.name,
+            hardwareAcceleration: audioMode === 'extract' ? false : hardwareAcceleration,
+            audioMode,
+            audioVolume,
+            audioMuteRanges,
+            workingOutputPath: audioMode === 'extract'
+                ? path.join(TEMP_DIR, `audio_source_${jobId}.mp4`)
+                : outputTarget.outputPath,
             progress: 0,
             progressMessage: 'Starting...',
             createdAt: createdAt,
@@ -1562,9 +1753,11 @@ app.post('/trim', express.json(), async (req, res) => {
             message: 'Video processing started',
             originalName: videoInfo.originalName,
             inputSize: videoInfo.size,
-            compressionMode: compressionMode,
-            compressionName: compressionConfig.name,
-            hardwareAcceleration,
+            compressionMode: processingCompressionMode,
+            compressionName: audioMode === 'extract' ? 'Audio extraction' : compressionConfig.name,
+            hardwareAcceleration: audioMode === 'extract' ? false : hardwareAcceleration,
+            audioMode,
+            audioVolume,
             estimatedTime: compressionConfig.estimatedTime,
             qualityLevel: compressionConfig.qualityLevel
         });
@@ -1598,6 +1791,7 @@ app.get('/status/:jobId', (req, res) => {
         compressionName: job.compressionName,
         hardwareAcceleration: Boolean(job.hardwareAcceleration),
         hardwareAccelerationFallbackAttempted: Boolean(job.hardwareAccelerationFallbackAttempted),
+        audioMode: job.audioMode,
         createdAt: job.createdAtISO,
         iteration: job.currentIteration,
         totalIterations: job.totalIterations
@@ -1684,6 +1878,112 @@ app.post('/cancel/:jobId', (req, res) => {
 
 
 
+async function applyAudioOutput(inputPath, finalOutputPath, audioMode, audioVolume, audioMuteRanges = [], job = null) {
+    const partialMuteFilters = buildPartialMuteFilters(audioMuteRanges);
+    if (audioMode === 'keep' && partialMuteFilters.length === 0) return;
+
+    const metadata = await probeMedia(inputPath);
+    const audioStream = metadata.streams.find((stream) => stream.codec_type === 'audio');
+    if (audioMode === 'extract' && !audioStream) {
+        throw new Error('The selected video does not contain an audio track to extract');
+    }
+    if ((audioMode === 'volume' || audioMode === 'mute' || partialMuteFilters.length > 0) && !audioStream) {
+        return;
+    }
+
+    const duration = Number(metadata.format.duration) || null;
+    const audioBitrate = Math.min(Number(audioStream?.bit_rate) || 192000, 320000);
+    const tempOutputPath = audioMode === 'extract'
+        ? finalOutputPath
+        : path.join(TEMP_DIR, `audio_${audioMode}_${job?.id || crypto.randomUUID()}.mp4`);
+    let args;
+
+    if (audioMode === 'extract') {
+        args = [
+            '-i', inputPath,
+            '-map', '0:a:0',
+            '-vn',
+            '-c:a', 'aac',
+            '-b:a', String(audioBitrate),
+            '-f', 'ipod',
+            tempOutputPath
+        ];
+    } else if (audioMode === 'mute') {
+        args = [
+            '-i', inputPath,
+            '-map', '0:v:0',
+            '-map', '0:s?',
+            '-c', 'copy',
+            '-an',
+            '-movflags', '+faststart',
+            '-f', 'mp4',
+            tempOutputPath
+        ];
+    } else {
+        const audioFilters = [];
+        if (audioMode === 'volume') audioFilters.push(`volume=${audioVolume}`);
+        audioFilters.push(...partialMuteFilters);
+        args = [
+            '-i', inputPath,
+            '-map', '0:v:0',
+            '-map', '0:a?',
+            '-map', '0:s?',
+            '-c:v', 'copy',
+            '-c:s', 'copy',
+            '-c:a', 'aac',
+            '-b:a', String(audioBitrate),
+            '-filter:a', audioFilters.join(','),
+            '-movflags', '+faststart',
+            '-f', 'mp4',
+            tempOutputPath
+        ];
+    }
+
+    if (job) job.progressMessage = audioMode === 'extract' ? 'Extracting audio...' : 'Applying audio settings...';
+    await runDirectFfmpeg(args, {
+        duration,
+        job,
+        label: audioMode === 'extract' ? '[Audio extraction]' : '[Audio output]'
+    });
+
+    if (audioMode === 'extract') {
+        if (inputPath !== finalOutputPath) await fs.unlink(inputPath);
+        return;
+    }
+
+    await fs.unlink(inputPath);
+    await fs.rename(tempOutputPath, finalOutputPath);
+}
+
+async function extractTrimmedAudio(inputPath, outputPath, startTime, duration, audioMuteRanges = [], job = null, progressCallback = null) {
+    const metadata = await probeMedia(inputPath);
+    const audioStream = metadata.streams.find((stream) => stream.codec_type === 'audio');
+    if (!audioStream) {
+        throw new Error('The selected video does not contain an audio track to extract');
+    }
+
+    const audioBitrate = Math.min(Number(audioStream.bit_rate) || 192000, 320000);
+    if (job) job.progressMessage = 'Extracting audio...';
+    const args = [
+        '-ss', String(startTime),
+        '-t', String(duration),
+        '-i', inputPath,
+        '-map', '0:a:0',
+        '-vn',
+        '-c:a', 'aac',
+        '-b:a', String(audioBitrate),
+    ];
+    const partialMuteFilters = buildPartialMuteFilters(audioMuteRanges);
+    if (partialMuteFilters.length > 0) args.push('-filter:a', partialMuteFilters.join(','));
+    args.push('-f', 'ipod', outputPath);
+    await runDirectFfmpeg(args, {
+        duration,
+        progressCallback,
+        job,
+        label: '[Audio extraction]'
+    });
+}
+
 // Async video processing function with compression modes
 async function processVideoAsync(jobId) {
     const job = jobs.get(jobId);
@@ -1697,14 +1997,32 @@ async function processVideoAsync(jobId) {
 
         const outputFilename = job.outputFilename;
         const outputPath = job.outputPath;
+        const workingOutputPath = job.workingOutputPath || outputPath;
         
         console.log(`Starting video processing for job ${jobId}`);
         console.log(`Input: ${job.inputPath}`);
         console.log(`Output: ${outputPath}`);
         console.log(`Compression mode: ${job.compressionMode}`);
         
-        // Check if this is a multi-track job
-        if (job.tracks && job.tracks.length > 0) {
+        let audioOutputApplied = false;
+
+        // Audio-only output can be trimmed directly without spending time encoding video.
+        if (job.audioMode === 'extract' && !(job.tracks && job.tracks.length > 0)) {
+            const trimDuration = job.endTime - job.startTime;
+            await extractTrimmedAudio(
+                job.inputPath,
+                outputPath,
+                job.startTime,
+                trimDuration,
+                makeRelativeAudioMuteRanges(job.audioMuteRanges || [], job.startTime),
+                job,
+                (progress) => {
+                    job.progress = progress;
+                    job.progressMessage = `Extracting audio: ${progress}%`;
+                }
+            );
+            audioOutputApplied = true;
+        } else if (job.tracks && job.tracks.length > 0) {
             console.log(`Processing ${job.tracks.length} tracks`);
             // Normalize every segment before concatenating it. The concat
             // demuxer can only stream-copy tracks whose codec parameters match;
@@ -1741,6 +2059,8 @@ async function processVideoAsync(jobId) {
                     track.startTime,
                     track.endTime,
                     concatProfile,
+                    track.audioMode,
+                    track.audioMuteRanges,
                     onTrackProgress,
                     job
                 );
@@ -1755,8 +2075,8 @@ async function processVideoAsync(jobId) {
             // Combine all processed tracks
             await combineVideoTracks(
                 processedTracks,
-                outputPath,
-                job.compressionMode,
+                workingOutputPath,
+                job.audioMode === 'extract' ? 'original' : job.compressionMode,
                 (progress) => {
                     // For multi-track jobs, we consider track processing complete at this point (100%)
                     // and this is now a new process starting from 0%
@@ -1777,7 +2097,7 @@ async function processVideoAsync(jobId) {
             console.log(`Processing single video`);
             await trimVideoWithCompression(
                 job.inputPath,
-                outputPath,
+                workingOutputPath,
                 job.startTime,
                 job.endTime,
                 job.compressionMode,
@@ -1795,6 +2115,17 @@ async function processVideoAsync(jobId) {
             return;
         }
 
+        if (!audioOutputApplied) {
+            await applyAudioOutput(
+                workingOutputPath,
+                outputPath,
+                job.audioMode || 'keep',
+                job.audioVolume ?? 0.5,
+                makeRelativeAudioMuteRanges(job.audioMuteRanges || [], job.startTime || 0),
+                job
+            );
+        }
+
         // Get output file size
         const stats = await fs.stat(outputPath);
         const outputSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
@@ -1806,7 +2137,7 @@ async function processVideoAsync(jobId) {
         job.outputSize = outputSizeMB;
         job.duration = Math.max(0, (Date.now() - job.createdAt.getTime()) / 1000);
         
-        console.log(`Video processing completed successfully`);
+        console.log(`Output processing completed successfully`);
         console.log(`Output file: ${outputFilename} (${outputSizeMB} MB)`);
         
     } catch (error) {
@@ -2093,7 +2424,7 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                 );
 
                 // Fits under cap: stream-copy trim only (no extra encode; start may align to keyframe).
-                if (estTrimmedMB <= config.sizeLimitMB) {
+                if (!config.alwaysCompress && estTrimmedMB <= config.sizeLimitMB) {
                     console.log(
                         `[${compressionMode.toUpperCase()}] Estimated under limit - stream copy from original`
                     );
@@ -2103,8 +2434,15 @@ function trimVideoWithCompression(inputPath, outputPath, startTime, endTime, com
                     return;
                 }
 
+
+                if (config.alwaysCompress && estTrimmedMB <= config.sizeLimitMB) {
+                    console.log(
+                        `[${compressionMode.toUpperCase()}] Estimated under limit, but preset is configured to always compress`
+                    );
+                }
+
                 console.log(
-                    `[${compressionMode.toUpperCase()}] Over limit, compressing to ${config.targetSizeMB}MB target (single pass from original)`
+                    `[${compressionMode.toUpperCase()}] ${estTrimmedMB <= config.sizeLimitMB ? 'Forced compression' : 'Over limit'}; compressing to ${config.targetSizeMB}MB target (single pass from original)`
                 );
                 await compressWithBitrateAdjustment(
                     inputPath,
@@ -2303,7 +2641,17 @@ async function getConcatNormalizationProfile(inputPath, hardwareAcceleration = f
     };
 }
 
-async function normalizeVideoForConcat(inputPath, outputPath, startTime, endTime, profile, progressCallback = null, job = null) {
+async function normalizeVideoForConcat(
+    inputPath,
+    outputPath,
+    startTime,
+    endTime,
+    profile,
+    audioMode = 'keep',
+    audioMuteRanges = [],
+    progressCallback = null,
+    job = null
+) {
     const duration = endTime - startTime;
     const { hasAudio } = await getPrimaryMediaInfo(inputPath);
     const frameRate = Number(profile.frameRate.toFixed(3));
@@ -2326,6 +2674,11 @@ async function normalizeVideoForConcat(inputPath, outputPath, startTime, endTime
             '-preset', 'veryfast',
             '-crf', '18'
         ];
+    const relativeMuteRanges = makeRelativeAudioMuteRanges(audioMuteRanges, startTime);
+    const audioFilters = audioMode === 'mute'
+        ? ['volume=0']
+        : buildPartialMuteFilters(relativeMuteRanges);
+    audioFilters.push('apad', 'aresample=async=1:first_pts=0');
 
     const trimCommand = [
         '-y',
@@ -2353,7 +2706,7 @@ async function normalizeVideoForConcat(inputPath, outputPath, startTime, endTime
         '-b:a', '192k',
         '-ar', '48000',
         '-ac', '2',
-        '-af', 'apad,aresample=async=1:first_pts=0',
+        '-af', audioFilters.join(','),
         '-t', String(duration),
         '-shortest',
         '-avoid_negative_ts', 'make_zero',
@@ -2537,58 +2890,104 @@ app.use((error, req, res, next) => {
 });
 
 // Start server
+let httpServer = null;
+let parentMonitor = null;
+let shuttingDown = false;
+
+function isParentProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        // EPERM means the process exists but cannot be signalled by this user.
+        return error?.code === 'EPERM';
+    }
+}
+
+function startParentMonitor() {
+    if (!PARENT_PID) return;
+    parentMonitor = setInterval(() => {
+        if (!isParentProcessAlive(PARENT_PID)) {
+            void shutdownServer(`Parent application ${PARENT_PID} is no longer running`);
+        }
+    }, 750);
+    parentMonitor.unref();
+}
+
 async function startServer() {
     try {
         await ensureDirectories();
-        
-        app.listen(PORT, HOST, () => {
-            console.log('Video Trimmer Server with Compression Modes');
-            console.log('========================================================');
-            console.log(`Server running on: http://${HOST}:${PORT}`);
-            console.log(`Health check: http://${HOST}:${PORT}/health`);
-            console.log('========================================================');
-            console.log('Ready to process videos with compression!');
-            console.log(`Available compression modes: ${Object.keys(COMPRESSION_MODES).length}`);
-            console.log('ALL video processing is asynchronous');
-            console.log('Automatic cleanup every 30 minutes');
-            if (!process.env.VIDEO_TRIMMER_AUTH_TOKEN) {
-                console.log(`Development API token: ${API_TOKEN}`);
-            }
+
+        httpServer = await new Promise((resolve, reject) => {
+            const server = app.listen(PORT, HOST, () => resolve(server));
+            server.once('error', reject);
         });
+
+        console.log('Video Trimmer Server with Compression Modes');
+        console.log('========================================================');
+        console.log(`Server running on: http://${HOST}:${PORT}`);
+        console.log(`Health check: http://${HOST}:${PORT}/health`);
+        console.log('========================================================');
+        console.log('Ready to process videos with compression!');
+        console.log(`Available compression modes: ${Object.keys(COMPRESSION_MODES).length}`);
+        console.log('ALL video processing is asynchronous');
+        console.log('Automatic cleanup every 30 minutes');
+        if (PARENT_PID) console.log(`Monitoring desktop parent process: ${PARENT_PID}`);
+        if (!process.env.VIDEO_TRIMMER_AUTH_TOKEN) {
+            console.log(`Development API token: ${API_TOKEN}`);
+        }
     } catch (error) {
         console.error('❌ Failed to start server:', error);
         process.exit(1);
     }
 }
 
-// Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\nShutting down server...');
-    
+async function shutdownServer(reason = 'Shutdown requested', exitCode = 0) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${reason}; shutting down server...`);
+
+    clearInterval(cleanupInterval);
+    clearTimeout(initialCleanupTimeout);
+    if (parentMonitor) clearInterval(parentMonitor);
+
+    for (const [jobId, job] of jobs.entries()) {
+        if (job.status === 'processing') {
+            job.status = 'cancelled';
+            terminateFfmpegProcess(job, jobId);
+        }
+    }
+
+    if (httpServer) {
+        await new Promise((resolve) => {
+            let finished = false;
+            const finish = () => {
+                if (finished) return;
+                finished = true;
+                resolve();
+            };
+            httpServer.close(finish);
+            setTimeout(() => {
+                httpServer.closeAllConnections?.();
+                finish();
+            }, 1500).unref();
+        });
+    }
+
     try {
-        // Final cleanup
         await cleanupOldFiles();
         console.log('Final cleanup completed');
     } catch (error) {
         console.warn('Final cleanup warning:', error.message);
     }
-    
+
     console.log('Server stopped gracefully');
-    process.exit(0);
-});
+    process.exit(exitCode);
+}
 
-// Handle other termination signals
-process.on('SIGTERM', async () => {
-    console.log('\nReceived SIGTERM, shutting down gracefully...');
-    
-    try {
-        await cleanupOldFiles();
-        console.log('Final cleanup completed');
-    } catch (error) {
-        console.warn('Final cleanup warning:', error.message);
-    }
-    
-    process.exit(0);
-});
+process.on('SIGINT', () => void shutdownServer('Received SIGINT'));
+process.on('SIGTERM', () => void shutdownServer('Received SIGTERM'));
+process.on('SIGHUP', () => void shutdownServer('Received SIGHUP'));
 
-startServer();  
+startParentMonitor();
+void startServer();

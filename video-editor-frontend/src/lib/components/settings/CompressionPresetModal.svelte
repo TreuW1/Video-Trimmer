@@ -24,16 +24,16 @@
     name: '',
     description: '',
     processingStrategy: 'manual',
-    rateControl: 'constantQuality',
-    videoCodec: 'libx265',
+    rateControl: 'targetSize',
+    videoCodec: 'libx264',
     audioCodec: 'aac',
     options: [],
     extraOptions: [],
     targetSizePercent: 50,
-    targetSizeMB: 25,
-    sizeLimitMB: 30,
+    targetSizeMB: 18.5,
+    sizeLimitMB: 20,
     sizeLabel: '',
-    bitrateKbps: 2500,
+    bitrateKbps: 8000,
     maxrateKbps: null,
     bufsizeKbps: null,
     audioBitrateKbps: 128,
@@ -43,12 +43,13 @@
     height: null,
     fps: null,
     encoderPreset: 'medium',
-    profile: '',
-    level: '',
+    profile: 'main',
+    level: '4.2',
     tune: '',
     pixelFormat: 'yuv420p',
     audioSampleRate: null,
     audioChannels: null,
+    alwaysCompress: false,
     estimatedTime: 'Custom',
     qualityLevel: 'Custom',
     builtIn: false
@@ -211,7 +212,7 @@
               <option value="libx265">H.265 / HEVC</option>
               <option value="libsvtav1">AV1 / SVT-AV1</option>
               <option value="libaom-av1">AV1 / libaom</option>
-              <option value="libaom-av2">AV2 / experimental</option>
+              <option value="libaom-av2">AV2 / Experimental</option>
               <option value="copy">Copy video</option>
             </select>
           </label>
@@ -259,6 +260,22 @@
           </label>
         </div>
 
+        <label class="mt-4 flex items-start gap-3 rounded-lg border border-gray-700/60 bg-gray-900/40 p-3 {targetSizeActive ? '' : 'opacity-45'}">
+          <input
+            type="checkbox"
+            class="mt-0.5 rounded border-gray-600 bg-gray-800 text-blue-500 focus:ring-blue-500"
+            checked={draft.alwaysCompress ?? false}
+            disabled={!targetSizeActive}
+            onchange={(event) => {
+              draft = { ...draft, alwaysCompress: event.currentTarget.checked };
+            }}
+          />
+          <span>
+            <span class="block text-sm font-medium text-slate-200">Always run compression for Target MB</span>
+            <span class="mt-0.5 block text-xs text-slate-500">When selected compression will be ran regardless of initial size check.</span>
+          </span>
+        </label>
+
         <div class="mt-5 grid gap-4 md:grid-cols-4">
           <label class="block">
             <span class="mb-1 block text-xs font-medium uppercase text-slate-400">Width</span>
@@ -285,7 +302,7 @@
           </label>
           <label class="block">
             <span class="mb-1 block text-xs font-medium uppercase text-slate-400">Level</span>
-            <input class="w-full rounded-md border-gray-700 bg-gray-900 text-sm text-white" bind:value={draft.level} placeholder="4.1" />
+            <input class="w-full rounded-md border-gray-700 bg-gray-900 text-sm text-white" bind:value={draft.level} placeholder="4.2" />
           </label>
           <label class="block">
             <span class="mb-1 block text-xs font-medium uppercase text-slate-400">Tune</span>

@@ -1,17 +1,32 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 use tauri::{command, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_fs::FsExt;
 use tauri_plugin_prevent_default::{self as prevent_default, Flags, PlatformOptions};
+
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    },
+};
 
 const LIBRARY_VIDEO_EXTENSIONS: [&str; 8] =
     ["mp4", "avi", "mov", "mkv", "webm", "flv", "wmv", "m4v"];
@@ -44,6 +59,93 @@ struct BackendSecurityState {
     scopes: Mutex<FilesystemScopes>,
     app_data_dir: PathBuf,
     security_data_dir: PathBuf,
+}
+
+#[cfg(windows)]
+struct BackendJob(HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for BackendJob {}
+
+#[cfg(windows)]
+unsafe impl Sync for BackendJob {}
+
+#[cfg(windows)]
+impl BackendJob {
+    fn new() -> std::io::Result<Self> {
+        // A kill-on-close job makes the backend and every FFmpeg descendant an
+        // operating-system-owned part of the desktop app. Windows closes this
+        // handle even when the app is force-terminated.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &limits as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(error);
+        }
+
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        let assigned = unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BackendJob {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+struct BackendProcessState {
+    child: Mutex<Option<Child>>,
+    shutting_down: AtomicBool,
+    #[cfg(windows)]
+    job: Mutex<Option<BackendJob>>,
+}
+
+impl BackendProcessState {
+    fn new() -> Self {
+        #[cfg(windows)]
+        let job = match BackendJob::new() {
+            Ok(job) => Some(job),
+            Err(error) => {
+                eprintln!("Warning: Could not create backend process job: {error}");
+                None
+            }
+        };
+
+        Self {
+            child: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
+            #[cfg(windows)]
+            job: Mutex::new(job),
+        }
+    }
 }
 
 fn random_token() -> Result<String, String> {
@@ -657,6 +759,11 @@ fn find_node_executable(server_path: Option<&std::path::Path>) -> Option<String>
 }
 
 fn start_backend_server(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let process_state = app.state::<BackendProcessState>();
+    if process_state.shutting_down.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     // Try to get server.cjs path from resources (production build)
     // In Tauri v2, use resource_dir() and join the filename
     let server_path = match app.path().resource_dir() {
@@ -717,6 +824,7 @@ fn start_backend_server(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error
     cmd.arg(&server_path)
         .env("VIDEO_TRIMMER_DATA_DIR", &app_data_dir)
         .env("VIDEO_TRIMMER_AUTH_TOKEN", &security.auth_token)
+        .env("VIDEO_TRIMMER_PARENT_PID", std::process::id().to_string())
         .env("VIDEO_TRIMMER_SCOPES_FILE", &security.scopes_file)
         .env(
             "VIDEO_TRIMMER_BUILT_IN_COMPRESSION_PRESETS",
@@ -737,22 +845,98 @@ fn start_backend_server(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error
         cmd.current_dir(parent);
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to start backend server: {}", e))?;
 
     let pid = child.id();
 
-    // Store the process handle in app state for cleanup
-    if let Ok(mut child_guard) = app.state::<Mutex<Option<Child>>>().try_lock() {
-        *child_guard = Some(child);
-    } else {
-        return Err("Failed to access backend process state".into());
+    #[cfg(windows)]
+    if let Ok(job_guard) = process_state.job.lock() {
+        if let Some(job) = job_guard.as_ref() {
+            if let Err(error) = job.assign(&child) {
+                // The parent-PID monitor remains a fallback on systems that do
+                // not permit nested job assignment.
+                eprintln!("Warning: Could not assign backend to process job: {error}");
+            }
+        }
     }
+
+    // Take a blocking lock and re-check shutdown after spawning. This closes
+    // the race where the window exits while antivirus is still scanning the
+    // bundled Node executable.
+    let mut child_guard = process_state
+        .child
+        .lock()
+        .map_err(|_| "Backend process state is unavailable")?;
+    if process_state.shutting_down.load(Ordering::Acquire) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(());
+    }
+    if child_guard.is_some() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("Backend server is already running".into());
+    }
+    *child_guard = Some(child);
 
     println!("Backend server started successfully (PID: {})", pid);
 
     Ok(())
+}
+
+fn shutdown_backend(app: &tauri::AppHandle) {
+    let process_state = app.state::<BackendProcessState>();
+    if process_state.shutting_down.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let mut child = process_state
+        .child
+        .lock()
+        .ok()
+        .and_then(|mut child_guard| child_guard.take());
+
+    #[cfg(windows)]
+    {
+        // Closing the job terminates the complete tree, including any FFmpeg
+        // process currently owned by the backend.
+        if let Ok(mut job_guard) = process_state.job.lock() {
+            drop(job_guard.take());
+        }
+
+        // Keep an explicit tree kill as a fallback when job assignment was not
+        // available (for example under an older host process job policy).
+        if let Some(backend) = child.as_mut() {
+            if backend.try_wait().ok().flatten().is_none() {
+                let mut taskkill = Command::new("taskkill");
+                taskkill
+                    .args(["/F", "/T", "/PID", &backend.id().to_string()])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                taskkill.creation_flags(CREATE_NO_WINDOW);
+                let _ = taskkill.status();
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    if let Some(backend) = child.as_mut() {
+        let _ = backend.kill();
+    }
+
+    if let Some(mut backend) = child {
+        println!(
+            "Waiting for backend server (PID: {}) to stop...",
+            backend.id()
+        );
+        let _ = backend.wait();
+    }
+
+    let security = app.state::<BackendSecurityState>();
+    let _ = std::fs::remove_file(&security.scopes_file);
 }
 
 fn get_dev_server_path(app: &tauri::AppHandle) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -830,7 +1014,7 @@ fn main() {
         )
         .build();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
@@ -907,8 +1091,8 @@ fn main() {
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
             app.manage(security_state);
 
-            // Initialize backend process state
-            app.manage(std::sync::Mutex::<Option<std::process::Child>>::new(None));
+            // Initialize backend ownership before the asynchronous startup task.
+            app.manage(BackendProcessState::new());
 
             // Starting the bundled Node runtime can take a few seconds on Windows
             // (especially while antivirus scans the executable). Keep that work off
@@ -920,35 +1104,6 @@ fn main() {
                     eprintln!("The application will continue, but backend features may not work.");
                 }
             });
-
-            // Cleanup handler: kill backend process on app exit
-            let app_handle = app.handle().clone();
-            if let Some(window) = app.get_webview_window("main") {
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { .. } = event {
-                        if let Ok(mut child_guard) = app_handle
-                            .state::<std::sync::Mutex<Option<std::process::Child>>>()
-                            .try_lock()
-                        {
-                            if let Some(child) = child_guard.take() {
-                                println!("Shutting down backend server (PID: {})...", child.id());
-                                #[cfg(windows)]
-                                {
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(&["/F", "/T", "/PID", &child.id().to_string()])
-                                        .output();
-                                }
-                                #[cfg(not(windows))]
-                                {
-                                    let _ = child.kill();
-                                }
-                            }
-                        }
-                        let security = app_handle.state::<BackendSecurityState>();
-                        let _ = std::fs::remove_file(&security.scopes_file);
-                    }
-                });
-            }
 
             // Optional: Force initial focus
             if let Some(window) = app.get_webview_window("main") {
@@ -971,6 +1126,17 @@ fn main() {
             rename_library_video,
             open_library_video_location
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+
+    // Run-level cleanup covers window close, programmatic exit, restart, and
+    // platform shutdown instead of relying on one window event.
+    app.run(|app_handle, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            shutdown_backend(app_handle);
+        }
+    });
 }

@@ -13,7 +13,7 @@
   import StatusToast from '$lib/components/editor/StatusToast.svelte';
   import CompressionPresetModal from '$lib/components/settings/CompressionPresetModal.svelte';
   import SettingsDropdown from '$lib/components/settings/SettingsDropdown.svelte';
-  import type { CompressionPreset, UploadQueueItem, VideoTrack } from '$lib/types/editor';
+  import type { AudioMuteRange, AudioOutputMode, CompressionPreset, UploadQueueItem, VideoTrack } from '$lib/types/editor';
   import {
     createUploadQueueItem,
     findReusableUploadQueueItem,
@@ -51,6 +51,7 @@
   const GENERATE_OUTPUT_FILENAME_KEY = 'trimmerGenerateOutputFilename';
   const HARDWARE_ACCELERATION_KEY = 'trimmerHardwareAcceleration';
   const POPUP_NOTIFICATIONS_KEY = 'trimmerPopupNotifications';
+  const AUDIO_WAVEFORMS_HIDDEN_KEY = 'trimmerAudioWaveformsHidden';
   const HIDDEN_COMPRESSION_PRESETS_KEY = 'trimmerHiddenCompressionPresetIds';
   const CHANGE_VIDEO_SOURCE_KEY = 'trimmerPreferredChangeVideoSource';
   const LIBRARY_SCROLL_TOP_KEY = 'video_library_scroll_top';
@@ -60,6 +61,7 @@
       : null;
   type DisplayCompressionPreset = CompressionPreset & { hidden?: boolean };
   type ChangeVideoSource = 'file' | 'library';
+  type WaveformData = { peaks: number[]; hasAudio: boolean | null };
   type CompletedOutput = {
     outputSize: string;
     outputPath: string;
@@ -67,6 +69,26 @@
     timeTaken: string;
     preset: string;
   };
+
+  function normalizeAudioOutputMode(mode: unknown): AudioOutputMode {
+    return mode === 'mute' || mode === 'extract' ? mode : 'keep';
+  }
+
+  function normalizeAudioMuteRanges(ranges: unknown): AudioMuteRange[] {
+    if (!Array.isArray(ranges)) return [];
+    return ranges
+      .map((range) => ({
+        startTime: Number((range as Partial<AudioMuteRange>)?.startTime),
+        endTime: Number((range as Partial<AudioMuteRange>)?.endTime)
+      }))
+      .filter((range) =>
+        Number.isFinite(range.startTime) &&
+        Number.isFinite(range.endTime) &&
+        range.startTime >= 0 &&
+        range.endTime > range.startTime
+      )
+      .sort((left, right) => left.startTime - right.startTime);
+  }
 
   // Core state 
   let isEditorMounted = false;
@@ -95,6 +117,7 @@
   let statusType = $state("");
   let showStatus = $state(false);
   let popupNotificationsEnabled = $state(false);
+  let audioWaveformsHidden = $state(false);
   let showLoadingOverlay = $state(false);
   let loadingMessage = $state("Uploading video...");
   let loadingTitle = $state("Processing Video");
@@ -158,6 +181,7 @@
   let playheadScrubThrottle = createTimelineScrubThrottle();
   let trimScrubThrottle = createTimelineScrubThrottle();
   let shouldStopPlaybackAtTrimEnd = false;
+  let playbackAnimationFrameId: number | null = null;
 
   /** Playhead / timeline UI time: follows pointer while scrubbing or trim-dragging; else `currentTime`. */
   let timelineUiTime = $derived.by(() => {
@@ -194,6 +218,10 @@
 
   // Compression state
   let selectedCompressionMode = $state('original');
+  let audioOutputMode = $state<AudioOutputMode>('keep');
+  let pendingAudioOutputMode = $state<AudioOutputMode | null>(null);
+  let waveformByVideoId = $state<Record<string, WaveformData>>({});
+  let waveformLoadingVideoIds = $state<string[]>([]);
   let compressionModes = $state<DisplayCompressionPreset[]>([]);
   let expectedOutputSize = $state('');
   let outputDirectory = $state('');
@@ -537,7 +565,38 @@
 
   }
 
+  function stopPlaybackTimeTracking(): void {
+    if (playbackAnimationFrameId === null) return;
+    cancelAnimationFrame(playbackAnimationFrameId);
+    playbackAnimationFrameId = null;
+  }
+
+  function startPlaybackTimeTracking(player: HTMLVideoElement): void {
+    stopPlaybackTimeTracking();
+
+    const updateOnAnimationFrame = () => {
+      if (player !== videoPlayer || player.paused || player.ended) {
+        playbackAnimationFrameId = null;
+        return;
+      }
+
+      // `timeupdate` is intentionally low-frequency in browsers. Reading the
+      // media clock once per painted frame keeps the timeline playhead moving
+      // at display refresh rate without estimating or drifting from playback.
+      handlePlayerTimeUpdate(player);
+
+      if (!player.paused && !player.ended && player === videoPlayer) {
+        playbackAnimationFrameId = requestAnimationFrame(updateOnAnimationFrame);
+      } else {
+        playbackAnimationFrameId = null;
+      }
+    };
+
+    playbackAnimationFrameId = requestAnimationFrame(updateOnAnimationFrame);
+  }
+
   function handleTimelinePlayheadMouseDown(event: MouseEvent): void {
+    if (event.button !== 0) return;
     if (!videoPlayerReady || duration === 0 || isDraggingStart || isDraggingEnd) return;
     event.preventDefault();
     const timeline = event.currentTarget as HTMLElement;
@@ -556,6 +615,57 @@
   let tracks = $state<VideoTrack[]>([]);
   
   let activeTrackId = $state<string | null>(null);
+
+  let activeTrackForAudio = $derived(tracks.find((track) => track.id === activeTrackId));
+  let activeAudioDetached = $derived(activeTrackForAudio?.audioDetached ?? false);
+  let activeAudioMuteRanges = $derived(normalizeAudioMuteRanges(activeTrackForAudio?.audioMuteRanges));
+  let activeAudioWaveformHidden = $derived(
+    audioWaveformsHidden || (activeTrackForAudio?.audioWaveformHidden ?? false)
+  );
+  let activeWaveform = $derived(
+    activeTrackForAudio?.uploadedVideoId
+      ? waveformByVideoId[activeTrackForAudio.uploadedVideoId]
+      : undefined
+  );
+  let waveformPeaks = $derived(activeWaveform?.peaks ?? []);
+  let waveformHasAudio = $derived(activeWaveform?.hasAudio ?? null);
+  let waveformLoading = $derived(
+    !!activeTrackForAudio?.uploadedVideoId && waveformLoadingVideoIds.includes(activeTrackForAudio.uploadedVideoId)
+  );
+
+  $effect(() => {
+    if (!browser) return;
+    const videoId = activeTrackForAudio?.uploadedVideoId;
+    if (
+      !videoId ||
+      activeAudioWaveformHidden ||
+      waveformByVideoId[videoId] ||
+      waveformLoadingVideoIds.includes(videoId)
+    ) return;
+
+    waveformLoadingVideoIds = [...waveformLoadingVideoIds, videoId];
+    void fetch(`${API_BASE}/waveform/${encodeURIComponent(videoId)}?points=480`)
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Waveform request failed (${response.status})`);
+        const result = await response.json() as { peaks?: unknown; hasAudio?: unknown };
+        waveformByVideoId = {
+          ...waveformByVideoId,
+          [videoId]: {
+            peaks: Array.isArray(result.peaks)
+              ? result.peaks.filter((peak): peak is number => typeof peak === 'number' && Number.isFinite(peak))
+              : [],
+            hasAudio: result.hasAudio === true
+          }
+        };
+      })
+      .catch((error) => {
+        console.error('Could not load audio waveform:', error);
+        waveformByVideoId = { ...waveformByVideoId, [videoId]: { peaks: [], hasAudio: null } };
+      })
+      .finally(() => {
+        waveformLoadingVideoIds = waveformLoadingVideoIds.filter((id) => id !== videoId);
+      });
+  });
 
   // Add new state for drag and drop (mouse-based for Tauri WebView2 compatibility)
   let draggedTrackId = $state<string | null>(null);
@@ -739,6 +849,7 @@
       
       volume = track.volume;
       selectedCompressionMode = track.compressionMode;
+      audioOutputMode = normalizeAudioOutputMode(track.audioOutputMode);
     }
   }
 
@@ -753,6 +864,7 @@
           endTime,
           volume,
           compressionMode: selectedCompressionMode,
+          audioOutputMode,
           endTimeManuallySet: tracks[trackIndex].endTimeManuallySet // Preserve the flag
         };
         const track = tracks[trackIndex];
@@ -762,6 +874,10 @@
             endTime: track.endTime,
             compressionMode: track.compressionMode,
             volume: track.volume,
+            audioDetached: track.audioDetached,
+            audioWaveformHidden: track.audioWaveformHidden,
+            audioOutputMode: track.audioOutputMode,
+            audioMuteRanges: track.audioMuteRanges,
             endTimeManuallySet: track.endTimeManuallySet
           });
         }
@@ -773,6 +889,54 @@
     selectedCompressionMode = mode;
     saveTrackState();
   }
+
+  function setAudioOutputMode(mode: AudioOutputMode): void {
+    audioOutputMode = mode;
+    if (activeTrackId) {
+      const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+      if (trackIndex !== -1) {
+        tracks[trackIndex] = { ...tracks[trackIndex], audioOutputMode: mode };
+      }
+    }
+    saveTrackState();
+  }
+
+  function setAudioDetached(detached: boolean): void {
+    if (!activeTrackId) return;
+    const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+    if (trackIndex === -1) return;
+    tracks[trackIndex] = { ...tracks[trackIndex], audioDetached: detached };
+    saveTrackState();
+  }
+
+  function setAudioWaveformHidden(hidden: boolean): void {
+    if (!activeTrackId) return;
+    const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+    if (trackIndex === -1) return;
+    tracks[trackIndex] = { ...tracks[trackIndex], audioWaveformHidden: hidden };
+    saveTrackState();
+  }
+
+  function setAudioMuteRanges(ranges: AudioMuteRange[]): void {
+    if (!activeTrackId) return;
+    const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+    if (trackIndex === -1) return;
+    tracks[trackIndex] = {
+      ...tracks[trackIndex],
+      audioDetached: true,
+      audioMuteRanges: normalizeAudioMuteRanges(ranges)
+    };
+    saveTrackState();
+  }
+
+  $effect(() => {
+    if (!videoPlayer) return;
+    videoPlayer.muted =
+      audioOutputMode === 'mute' ||
+      activeAudioMuteRanges.some((range) =>
+        currentTime >= range.startTime && currentTime < range.endTime
+      );
+  });
 
   function handleStartTimeInput(): void {
     updateTrimDuration();
@@ -920,7 +1084,7 @@
     }
 
           // Create new track for each file
-          const newTrack = {
+          const newTrack: VideoTrack = {
             id: crypto.randomUUID(),
             videoFile: file,
             filePath: null, // No filePath for trimmer uploads
@@ -933,7 +1097,11 @@
             uploadedVideoId: null,
             endTimeManuallySet: false,
             selected: false,
-            duration: 0
+            duration: 0,
+            audioDetached: false,
+            audioWaveformHidden: false,
+            audioOutputMode: 'keep',
+            audioMuteRanges: []
           };
 
     tracks = [...tracks, newTrack];
@@ -976,6 +1144,7 @@
     endTime = replacement.endTime;
     volume = replacement.volume;
     selectedCompressionMode = replacement.compressionMode;
+    audioOutputMode = normalizeAudioOutputMode(replacement.audioOutputMode);
     duration = replacement.duration;
     currentTime = 0;
     return true;
@@ -1001,7 +1170,11 @@
       uploadedVideoId: null,
       endTimeManuallySet: false,
       selected: false,
-      duration: 0
+      duration: 0,
+      audioDetached: false,
+      audioWaveformHidden: false,
+      audioOutputMode: 'keep',
+      audioMuteRanges: []
     };
 
     if (replaceActiveTrack(replacement)) {
@@ -1046,7 +1219,11 @@
       uploadedVideoId: null,
       endTimeManuallySet: rememberedState?.endTimeManuallySet ?? !!rememberedState?.endTime,
       selected: false,
-      duration: 0
+      duration: 0,
+      audioDetached: rememberedState?.audioDetached ?? false,
+      audioWaveformHidden: rememberedState?.audioWaveformHidden ?? false,
+      audioOutputMode: normalizeAudioOutputMode(rememberedState?.audioOutputMode),
+      audioMuteRanges: normalizeAudioMuteRanges(rememberedState?.audioMuteRanges)
     };
   }
 
@@ -1212,8 +1389,11 @@
           endTimeSeconds > startTimeSeconds &&
           player.currentTime <= endTimeSeconds;
         isPlaying = true;
+        startPlaybackTimeTracking(player);
       },
       pause: () => {
+        stopPlaybackTimeTracking();
+        handlePlayerTimeUpdate(player);
         isPlaying = false;
       },
       volumechange: () => {
@@ -1227,8 +1407,13 @@
       player.addEventListener(event, handler);
     });
 
+    if (!player.paused && !player.ended) {
+      startPlaybackTimeTracking(player);
+    }
+
     // Cleanup function
     return () => {
+      stopPlaybackTimeTracking();
       Object.entries(handlers).forEach(([event, handler]) => {
         player.removeEventListener(event, handler);
       });
@@ -1290,6 +1475,7 @@
   onMount(async () => {
     if (browser) {
       isEditorMounted = true;
+      audioWaveformsHidden = localStorage.getItem(AUDIO_WAVEFORMS_HIDDEN_KEY) === 'true';
       const savedSession = restoreEditorSession();
       if (savedSession && savedSession.tracks.length > 0) {
         tracks = savedSession.tracks;
@@ -1937,12 +2123,14 @@
   }
 
   function handleStartMarkerMouseDown(event: MouseEvent): void {
+    if (event.button !== 0) return;
     event.stopPropagation();
     resetTimelineScrubThrottle(trimScrubThrottle);
     isDraggingStart = true;
   }
 
   function handleEndMarkerMouseDown(event: MouseEvent): void {
+    if (event.button !== 0) return;
     event.stopPropagation();
     resetTimelineScrubThrottle(trimScrubThrottle);
     isDraggingEnd = true;
@@ -2113,8 +2301,9 @@
         console.log('Job status:', result);
         
         if (result.status === 'completed') {
+          const extractedAudio = result.audioMode === 'extract';
           loadingTitle = 'Processing Complete!';
-          loadingMessage = 'Video processed and saved successfully.';
+          loadingMessage = `${extractedAudio ? 'Audio' : 'Video'} processed and saved successfully.`;
           activeAnimationCancel?.();
           progressPercent = 100;
           completedOutput = {
@@ -2135,7 +2324,7 @@
           };
           isProcessing = false;
           currentJobId = null;
-          displayStatus('Video processed and saved', 'success');
+          displayStatus(`${extractedAudio ? 'Audio' : 'Video'} processed and saved`, 'success');
           finish();
           return;
         } 
@@ -2231,6 +2420,11 @@
     if (!enabled) showStatus = false;
   }
 
+  function setAudioWaveformsHidden(hidden: boolean): void {
+    audioWaveformsHidden = hidden;
+    localStorage.setItem(AUDIO_WAVEFORMS_HIDDEN_KEY, String(hidden));
+  }
+
   function persistOutputDirectory(): void {
     if (!browser) return;
     if (outputDirectory) {
@@ -2274,10 +2468,15 @@
     persistOutputDirectory();
   }
 
-  function normalizeOutputFilename(filename: string): string {
+  function normalizeOutputFilename(filename: string, mode: AudioOutputMode): string {
     const trimmed = filename.trim();
     if (!trimmed) return '';
-    return trimmed.toLowerCase().endsWith('.mp4') ? trimmed : `${trimmed}.mp4`;
+    const extension = mode === 'extract' ? '.m4a' : '.mp4';
+    let normalized = trimmed;
+    while (/\.(?:mp4|m4a)$/i.test(normalized)) {
+      normalized = normalized.slice(0, -4);
+    }
+    return `${normalized}${extension}`;
   }
 
   function validateOutputFilename(filename: string): string {
@@ -2299,6 +2498,21 @@
   }
 
   async function requestTrimmedVideo(): Promise<void> {
+    saveTrackState();
+    const activeTrack = tracks.find((track) => track.id === activeTrackId);
+    const selectedTracks = tracks.filter((track) => track.selected);
+    const isCombining = selectedTracks.length > 1;
+    const hasIgnoredExtractMode = isCombining && selectedTracks.some(
+      (track) => normalizeAudioOutputMode(track.audioOutputMode) === 'extract'
+    );
+    if (hasIgnoredExtractMode) {
+      window.alert(
+        'Extract audio only is not available when combining multiple clips. This option will be ignored and an MP4 video will be created.'
+      );
+    }
+    pendingAudioOutputMode = isCombining
+      ? 'keep'
+      : normalizeAudioOutputMode(activeTrack?.audioOutputMode ?? audioOutputMode);
     outputFilename = '';
     outputOptionsError = '';
 
@@ -2312,7 +2526,10 @@
 
   async function confirmOutputOptions(): Promise<void> {
     if (!generateOutputFilename) {
-      const normalizedFilename = normalizeOutputFilename(outputFilename);
+      const normalizedFilename = normalizeOutputFilename(
+        outputFilename,
+        pendingAudioOutputMode ?? audioOutputMode
+      );
       const filenameError = validateOutputFilename(normalizedFilename);
       if (filenameError) {
         outputOptionsError = filenameError;
@@ -2470,6 +2687,13 @@
   async function downloadTrimmedVideo(): Promise<void> {
     if (!browser) return;
 
+    // Keep one immutable snapshot for the filename, UI, and request payload.
+    // Player events and track persistence must not change an in-flight export.
+    const selectedTracks = tracks.filter(t => t.selected);
+    const isCombining = selectedTracks.length > 1;
+    const processingAudioMode = isCombining ? 'keep' : pendingAudioOutputMode ?? audioOutputMode;
+    const processingCompressionMode = processingAudioMode === 'extract' ? 'original' : selectedCompressionMode;
+
     // Check if we have an active track with a video loaded
     if (!activeTrackId) {
       displayStatus('Please select a track to trim.', 'error');
@@ -2483,8 +2707,6 @@
     }
 
     // Gather selected tracks for combining (only if more than one is selected)
-    const selectedTracks = tracks.filter(t => t.selected);
-
     // If more than one track is selected, combine them
     if (selectedTracks.length > 1) {
       // Ensure all selected tracks are uploaded
@@ -2505,8 +2727,8 @@
 
       showLoadingOverlay = true;
       completedOutput = null;
-      loadingMessage = 'Processing combined tracks...';
-      loadingTitle = 'Combining & Trimming Videos';
+      loadingMessage = processingAudioMode === 'extract' ? 'Combining tracks and extracting audio...' : 'Processing combined tracks...';
+      loadingTitle = processingAudioMode === 'extract' ? 'Combining & Extracting Audio' : 'Combining & Trimming Videos';
       useSpinner = false;
       progressPercent = 0;
       isProcessing = true;
@@ -2521,10 +2743,13 @@
             tracks: selectedTracks.map(t => ({
               videoId: t.uploadedVideoId,
               startTime: parseTime(t.startTime),
-              endTime: parseTime(t.endTime)
+              endTime: parseTime(t.endTime),
+              audioMode: normalizeAudioOutputMode(t.audioOutputMode),
+              audioMuteRanges: normalizeAudioMuteRanges(t.audioMuteRanges)
             })),
-            compressionMode: selectedCompressionMode,
-            hardwareAcceleration: hardwareAccelerationEnabled,
+            compressionMode: processingCompressionMode,
+            hardwareAcceleration: processingAudioMode === 'extract' ? false : hardwareAccelerationEnabled,
+            audioMode: processingAudioMode,
             ...(outputFilename ? { outputFilename } : {}),
             ...(outputDirectory ? { outputDirectory } : {})
           })
@@ -2570,10 +2795,12 @@
     }
     showLoadingOverlay = true;
     completedOutput = null;
-    loadingMessage = 'Processing video...';
-    const compressionPreset = compressionModes.find((mode) => mode.id === selectedCompressionMode);
+    loadingMessage = processingAudioMode === 'extract' ? 'Trimming and extracting audio...' : 'Processing video...';
+    const compressionPreset = compressionModes.find((mode) => mode.id === processingCompressionMode);
     loadingTitle =
-      compressionPreset?.processingStrategy === 'directCopy'
+      processingAudioMode === 'extract'
+        ? 'Extracting Audio'
+        : compressionPreset?.processingStrategy === 'directCopy'
         ? 'Trimming Video'
         : `Trimming and Compressing Video (${compressionPreset?.name ?? selectedCompressionMode})`;
     useSpinner = false;
@@ -2589,8 +2816,10 @@
           videoId: activeTrack.uploadedVideoId,
           startTime: startTimeSeconds,
           endTime: endTimeSeconds,
-          compressionMode: selectedCompressionMode,
-          hardwareAcceleration: hardwareAccelerationEnabled,
+          compressionMode: processingCompressionMode,
+          hardwareAcceleration: processingAudioMode === 'extract' ? false : hardwareAccelerationEnabled,
+          audioMode: processingAudioMode,
+          audioMuteRanges: normalizeAudioMuteRanges(activeTrack.audioMuteRanges),
           ...(outputFilename ? { outputFilename } : {}),
           ...(outputDirectory ? { outputDirectory } : {})
         })
@@ -3127,21 +3356,21 @@
               </div>
 
               <button
-              onclick={toggleFullscreen}
-              class="absolute top-4 right-4 p-2 bg-gray-800/80 hover:bg-gray-700/80 rounded-lg text-white transition-all duration-200 shadow-lg backdrop-blur-sm border border-gray-700/30"
-              disabled={!controlsEnabled}
-              aria-label="Toggle Fullscreen"
-            >
-              {#if isFullscreen}
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 9V4.5 M9 9H4.5 M15 9V4.5 M15 9H19.5 M9 15V19.5 M9 15H4.5 M15 15V19.5 M15 15H19.5" />
-                </svg>
-              {:else}
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4 m0 0h4 M4 4l5 5 M20 8V4 m0 0h-4 M20 4l-5 5 M4 16v4 m0 -1h4 M4 20l5-5 M20 16v4 m0 0h-4 M20 20l-5-5" clip-rule="evenodd" />
-                </svg>
-              {/if}
-            </button>
+                onclick={toggleFullscreen}
+                class="rounded-lg border border-gray-700/30 bg-gray-800/80 p-2 text-white shadow-lg backdrop-blur-sm transition-all duration-200 hover:bg-gray-700/80"
+                disabled={!controlsEnabled}
+                aria-label="Toggle Fullscreen"
+              >
+                {#if isFullscreen}
+                  <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 9V4.5 M9 9H4.5 M15 9V4.5 M15 9H19.5 M9 15V19.5 M9 15H4.5 M15 15V19.5 M15 15H19.5" />
+                  </svg>
+                {:else}
+                  <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4 m0 0h4 M4 4l5 5 M20 8V4 m0 0h-4 M20 4l-5 5 M4 16v4 m0 -1h4 M4 20l5-5 M20 16v4 m0 0h-4 M20 20l-5-5" clip-rule="evenodd" />
+                  </svg>
+                {/if}
+              </button>
             </div>
 
             <Timeline
@@ -3157,10 +3386,23 @@
               {endTimeSeconds}
               {isDraggingStart}
               {isDraggingEnd}
+              {waveformPeaks}
+              {waveformLoading}
+              {waveformHasAudio}
+              audioDetached={activeAudioDetached}
+              audioWaveformHidden={activeAudioWaveformHidden}
+              audioWaveformGloballyHidden={audioWaveformsHidden}
+              {audioOutputMode}
+              audioMuteRanges={activeAudioMuteRanges}
               onTimelineMouseDown={handleTimelinePlayheadMouseDown}
               onStartMarkerMouseDown={handleStartMarkerMouseDown}
               onEndMarkerMouseDown={handleEndMarkerMouseDown}
               onKeydown={handleKeyboardShortcuts}
+              {setAudioDetached}
+              {setAudioWaveformHidden}
+              {setAudioWaveformsHidden}
+              {setAudioOutputMode}
+              {setAudioMuteRanges}
             />
           </div>
         </div>
@@ -3177,6 +3419,7 @@
         bind:endTime
         {selectedCompressionMode}
         {compressionModes}
+        audioOnlyOutput={audioOutputMode === 'extract' && selectedTrackCount <= 1}
         {expectedOutputSize}
         {selectedTrackCount}
         tracksLength={tracks.length}
@@ -3216,6 +3459,7 @@
   {outputDirectory}
   {outputFilename}
   {generateOutputFilename}
+  outputExtension={(pendingAudioOutputMode ?? audioOutputMode) === 'extract' ? 'm4a' : 'mp4'}
   error={outputOptionsError}
   onChooseDirectory={chooseOutputDirectory}
   onFilenameChange={setOutputFilename}
@@ -3224,6 +3468,7 @@
   onClose={() => {
     showOutputOptions = false;
     outputOptionsError = '';
+    pendingAudioOutputMode = null;
   }}
 />
 

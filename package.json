@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "version": "1.0.0",
+  "version": "1.0.5",
   "dependencies": {
     "compression": "1.8.1",
     "cors": "2.8.6",
@@ -17,6 +17,7 @@
     "path-to-regexp": "8.4.0"
   },
   "scripts": {
+    "test": "node --test",
     "dev": "node scripts/dev.cjs",
     "build": "npm run build --prefix video-editor-frontend",
     "build:backend": "npm run licenses:generate && node scripts/build-backend.cjs",

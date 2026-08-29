@@ -91,7 +91,7 @@
 
   {#if isOpen}
     <div
-      class="absolute left-0 top-full z-50 mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-lg border border-gray-700/40 bg-gray-900/95 p-2 shadow-2xl backdrop-blur"
+      class="absolute left-0 top-full z-50 mt-2 max-h-[calc(100vh-4rem)] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-lg border border-gray-700/40 bg-gray-900/95 p-2 shadow-2xl backdrop-blur"
       role="menu"
     >
       <DropdownSetting

@@ -1,5 +1,12 @@
 export type UploadQueueStatus = 'pending' | 'uploading' | 'completed' | 'skipped' | 'failed';
 
+export type AudioOutputMode = 'keep' | 'mute' | 'extract';
+
+export type AudioMuteRange = {
+  startTime: number;
+  endTime: number;
+};
+
 export type UploadQueueItem = {
   file: File | null;
   filePath: string | null;
@@ -24,6 +31,10 @@ export type VideoTrack = {
   endTimeManuallySet: boolean;
   selected: boolean;
   duration: number;
+  audioDetached?: boolean;
+  audioWaveformHidden?: boolean;
+  audioOutputMode?: AudioOutputMode;
+  audioMuteRanges?: AudioMuteRange[];
 };
 
 export type CompressionPreset = {
@@ -56,6 +67,7 @@ export type CompressionPreset = {
   pixelFormat?: string | null;
   audioSampleRate?: number | null;
   audioChannels?: number | null;
+  alwaysCompress?: boolean;
   estimatedTime?: string;
   qualityLevel?: string;
   builtIn?: boolean;
@@ -67,5 +79,9 @@ export type LibraryClipState = {
   compressionMode?: string;
   volume?: number;
   endTimeManuallySet?: boolean;
+  audioDetached?: boolean;
+  audioWaveformHidden?: boolean;
+  audioOutputMode?: AudioOutputMode;
+  audioMuteRanges?: AudioMuteRange[];
 };
 

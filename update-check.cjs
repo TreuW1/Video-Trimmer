@@ -4,7 +4,9 @@ const GITHUB_LATEST_RELEASE_URL =
 function parseVersion(version) {
     if (typeof version !== 'string') return null;
 
-    const match = version.trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/);
+    // Accept the conventional "v1.2.3" prefix and the legacy "v.1.2.3"
+    // prefix used by the first public release.
+    const match = version.trim().match(/^(?:v\.?)?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/i);
     if (!match) return null;
 
     return {
@@ -79,7 +81,7 @@ async function checkForUpdate(currentVersion, fetchImpl = globalThis.fetch) {
 
         const release = await response.json();
         const latestVersion = typeof release.tag_name === 'string'
-            ? release.tag_name.trim().replace(/^v/i, '')
+            ? release.tag_name.trim().replace(/^v\.?/i, '')
             : '';
         if (!parseVersion(latestVersion)) throw new Error('The latest release has an invalid version tag');
 

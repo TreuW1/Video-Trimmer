@@ -72,5 +72,5 @@ npm run tauri build
 
 Wait for the build to complete, can take a few minutes.
 When the compiler finishes locate:
-trimmer\src-tauri\target\x86_64-pc-windows-gnu\release\bundle\nsis\VideoTrimmer_1.0.0_x64-setup.exe
+trimmer\src-tauri\target\x86_64-pc-windows-gnu\release\bundle\nsis\VideoTrimmer_1.0.5_x64-setup.exe
 Install to desired location.
