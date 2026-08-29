@@ -53,6 +53,7 @@ temp/
 tmp/
 uploads/
 outputs/
+test/
 
 # Vercel/Netlify
 .vercel

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { invoke } from '@tauri-apps/api/core';
   import { API_BASE, apiFetch } from '$lib/backendApi';
+  import { isTauri } from '$lib/utils';
   import appPackage from '../../../../package.json';
   import DropdownSetting from './DropdownSetting.svelte';
 
@@ -42,11 +44,13 @@
   let updateState = $state<'idle' | 'checking' | 'current' | 'available' | 'error'>('idle');
   let updateResult = $state<UpdateResult | null>(null);
   let updateError = $state('');
+  let releaseOpenError = $state('');
 
   async function checkForUpdates(): Promise<void> {
     updateState = 'checking';
     updateResult = null;
     updateError = '';
+    releaseOpenError = '';
 
     try {
       const response = await apiFetch(`${API_BASE}/update-check`);
@@ -58,6 +62,27 @@
     } catch (error) {
       updateError = error instanceof Error ? error.message : 'Could not check for updates.';
       updateState = 'error';
+    }
+  }
+
+  async function openReleasePage(): Promise<void> {
+    if (!updateResult) return;
+
+    releaseOpenError = '';
+
+    try {
+      if (isTauri()) {
+        await invoke('plugin:opener|open_url', { url: updateResult.releaseUrl });
+        return;
+      }
+
+      window.open(updateResult.releaseUrl, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      releaseOpenError = error instanceof Error
+        ? error.message
+        : typeof error === 'string'
+          ? error
+          : 'Could not open the release page.';
     }
   }
 
@@ -224,14 +249,16 @@
           {#if updateState === 'available' && updateResult}
             <div class="rounded-lg border border-emerald-700/40 bg-emerald-950/30 p-3 text-xs text-emerald-200">
               <p>Version {updateResult.latestVersion} is available.</p>
-              <a
-                href={updateResult.releaseUrl}
-                target="_blank"
-                rel="noopener noreferrer"
+              <button
+                type="button"
+                onclick={openReleasePage}
                 class="mt-2 inline-block font-medium text-emerald-300 underline decoration-emerald-600 underline-offset-2 hover:text-emerald-200"
               >
                 View release and download
-              </a>
+              </button>
+              {#if releaseOpenError}
+                <p class="mt-2 text-red-300">{releaseOpenError}</p>
+              {/if}
             </div>
           {:else if updateState === 'current' && updateResult}
             <p class="rounded-lg border border-gray-700/40 bg-gray-800/40 p-3 text-xs text-slate-300">

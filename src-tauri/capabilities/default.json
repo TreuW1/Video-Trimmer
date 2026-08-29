@@ -29,6 +29,13 @@
     "fs:scope-appdata-recursive",
     "core:resources:default",
     "core:resources:allow-close",
-    "opener:allow-open-url"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/TreuW1/Video-Trimmer/releases/*"
+        }
+      ]
+    }
   ]
 }
