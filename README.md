@@ -1,7 +1,7 @@
 ## [Download latest release](../../releases/latest)
 
 ## About
-VideoTrimmer is a desktop video trimming and compression application built with
+VideoTrimmer is a local desktop video trimming and compression application built with
 Tauri, Svelte and Node.js, designed for short form clips. See [INSTALL.md](INSTALL.md) for development and build setup.
 
 Please open up Issues if you have any suggestions as to what should be changed or added as a new feature.
@@ -16,10 +16,10 @@ Clicking on any of these videos will send them directly to the Trimmer part of a
 
 Upon being sent to the Trimmer you will welcome this screen:
 
-<img width="1892" height="954" alt="image" src="https://github.com/user-attachments/assets/46c23e83-5e72-484d-9ee0-843e3f5fe61a" />
+<img width="1904" height="959" alt="image" src="https://github.com/user-attachments/assets/ffa7d350-ea22-433a-8f94-6706abb78866" />
 
 
-On the left will end up the videos you selected, clicking on white boxes will let you combine all tracks which boxes are selected. Each track opens its own player where you set the nearest section's Start and End time using the side bars, or by pressing (S) - Start, (E) - End based on the current time indicator (red timestamp). Press (T) or use **Add kept section at playhead** to keep multiple parts of the same track; gray gaps are removed and all kept sections are stitched in timeline order. Press Delete to remove the highlighted kept section, or first select a muted portion to remove that instead. When multiple tracks are selected, every track's kept sections are stitched in track order.
+On the left will end up the videos you selected, clicking on white boxes will let you combine all tracks which boxes are selected. Each track opens its own player where you set the nearest section's Start and End time using the side bars, or by pressing (S) - Start, (E) - End based on the current time indicator (red timestamp). Press (T) or use **Add section at playhead** to keep multiple parts of the same track; allsections are stitched in timeline order. Press Delete to remove the highlighted kept section, or first select a muted portion to remove that instead. When multiple tracks are selected, every track's kept sections are stitched in track order. Use scroll wheel zoom into the timeline.
 
 <img width="542" height="138" alt="image" src="https://github.com/user-attachments/assets/23ae9b7f-ecf6-40c8-a8d9-b6266946e53b" />
 
