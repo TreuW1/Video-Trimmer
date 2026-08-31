@@ -15,6 +15,7 @@ let editorSession: EditorSession | null = null;
 function copyTrack(track: VideoTrack): VideoTrack {
   return {
     ...track,
+    trimRanges: track.trimRanges?.map((range) => ({ ...range })),
     audioMuteRanges: track.audioMuteRanges?.map((range) => ({ ...range }))
   };
 }

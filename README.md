@@ -19,7 +19,7 @@ Upon being sent to the Trimmer you will welcome this screen:
 <img width="1892" height="954" alt="image" src="https://github.com/user-attachments/assets/46c23e83-5e72-484d-9ee0-843e3f5fe61a" />
 
 
-On the left will end up the videos you selected, clicking on white boxes will let you combine all tracks which boxes are selected. Each track opens their own player where you set Start and End time using the side bars, or by Pressing (S) - Start, (E) End based on the current time indicator (red timestamp)
+On the left will end up the videos you selected, clicking on white boxes will let you combine all tracks which boxes are selected. Each track opens its own player where you set the nearest section's Start and End time using the side bars, or by pressing (S) - Start, (E) - End based on the current time indicator (red timestamp). Press (T) or use **Add kept section at playhead** to keep multiple parts of the same track; gray gaps are removed and all kept sections are stitched in timeline order. Press Delete to remove the highlighted kept section, or first select a muted portion to remove that instead. When multiple tracks are selected, every track's kept sections are stitched in track order.
 
 <img width="542" height="138" alt="image" src="https://github.com/user-attachments/assets/23ae9b7f-ecf6-40c8-a8d9-b6266946e53b" />
 

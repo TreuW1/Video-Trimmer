@@ -1,3 +1,8 @@
+import {
+  getTimelineViewportRange,
+  type TimelineViewport
+} from '$lib/utils/timelineViewport';
+
 /**
  * Timeline scrubbing: the playhead follows every pointer move, but the decoder handles only
  * one seek at a time. While that seek is in flight, pointer moves replace one pending target;
@@ -59,6 +64,29 @@ export function createAdaptiveTimelineScrubConfig(
   };
 }
 
+/**
+ * Dense media can use coarse preview seeks at the default scale. Zooming in
+ * progressively restores frame-level previews so the decoder detail matches
+ * the visible time detail; pointer release remains an exact seek.
+ */
+export function adjustTimelineScrubConfigForZoom(
+  config: TimelineScrubConfig,
+  zoom: number
+): TimelineScrubConfig {
+  const safeZoom = Number.isFinite(zoom) ? Math.max(1, zoom) : 1;
+  return {
+    ...config,
+    previewFrameIntervalSec: Math.max(
+      TIMELINE_SCRUB.previewFrameIntervalSec,
+      config.previewFrameIntervalSec / safeZoom
+    ),
+    minVideoSeekDeltaSec: Math.max(
+      TIMELINE_SCRUB.minVideoSeekDeltaSec,
+      config.minVideoSeekDeltaSec / safeZoom
+    )
+  };
+}
+
 export type TimelineScrubThrottle = {
   lastVideoTime: number;
   lastSeekAtMs: number;
@@ -103,9 +131,16 @@ export function clampTimelineTime(time: number, duration: number): number {
   return Math.max(0, Math.min(duration, time));
 }
 
-export function timeFromTimelineClientX(clientX: number, rect: DOMRect, duration: number): number {
+export function timeFromTimelineClientX(
+  clientX: number,
+  rect: DOMRect,
+  duration: number,
+  viewport?: TimelineViewport
+): number {
   const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
-  return clampTimelineTime((x / rect.width) * duration, duration);
+  const range = getTimelineViewportRange(viewport ?? { zoom: 1, startTime: 0 }, duration);
+  if (rect.width <= 0) return range.startTime;
+  return clampTimelineTime(range.startTime + (x / rect.width) * range.duration, duration);
 }
 
 function nearestPreviewFrame(
@@ -278,6 +313,17 @@ export function preciseVideoSeek(
   }
 ): void {
   const target = clampTimelineTime(time, duration);
+  const isAlreadyAtTarget = Math.abs(player.currentTime - target) <= 0.001;
+
+  // Avoid restarting a decoder operation that has already reached this exact target.
+  // This is especially important after an interactive preview seek on dense media.
+  if (isAlreadyAtTarget && !player.seeking) {
+    options.setCurrentTime(player.currentTime);
+    options.setUserSeeking(false);
+    options.onSettled?.();
+    return;
+  }
+
   const startedAt = performance.now();
   let settled = false;
   let timeoutId: number | 0 = 0;
@@ -326,5 +372,10 @@ export function preciseVideoSeek(
 
   timeoutId = window.setTimeout(fallbackSettle, 600);
   options.setSeekTimeout(timeoutId);
-  player.currentTime = target;
+  // `currentTime` reflects the requested target immediately, even while the
+  // decoder is still seeking. If that in-flight target is already exact, wait
+  // for it instead of cancelling and issuing the same seek a second time.
+  if (!isAlreadyAtTarget) {
+    player.currentTime = target;
+  }
 }

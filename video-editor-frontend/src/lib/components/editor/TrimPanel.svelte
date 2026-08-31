@@ -1,10 +1,14 @@
 <script lang="ts">
-  import type { CompressionPreset } from '$lib/types/editor';
+  import type { CompressionPreset, TrimRange } from '$lib/types/editor';
+  import { formatTime } from '$lib/utils/time';
 
   let {
     controlsEnabled,
     sidebarsInMainRow,
     showTrimOverlay,
+    trimRanges,
+    activeTrimRangeIndex,
+    canAddTrimRange,
     startTime = $bindable(),
     endTime = $bindable(),
     selectedCompressionMode,
@@ -19,6 +23,9 @@
     setCurrentAsStart,
     setCurrentAsEnd,
     playFromStart,
+    selectTrimRange,
+    addTrimRange,
+    removeTrimRange,
     setCompressionMode,
     openCompressionPresetModal,
     toggleCompressionPresetHidden,
@@ -28,6 +35,9 @@
     controlsEnabled: boolean;
     sidebarsInMainRow: boolean;
     showTrimOverlay: boolean;
+    trimRanges: TrimRange[];
+    activeTrimRangeIndex: number;
+    canAddTrimRange: boolean;
     startTime: string;
     endTime: string;
     selectedCompressionMode: string;
@@ -42,6 +52,9 @@
     setCurrentAsStart: () => void;
     setCurrentAsEnd: () => void;
     playFromStart: () => void;
+    selectTrimRange: (index: number, seekToStart?: boolean) => void;
+    addTrimRange: () => void;
+    removeTrimRange: (index: number) => void;
     setCompressionMode: (mode: string) => void;
     openCompressionPresetModal: (preset?: CompressionPreset) => void;
     toggleCompressionPresetHidden: (id: string) => void;
@@ -80,8 +93,49 @@
   {#if controlsEnabled}
     <div class="flex-1  overflow-auto p-4">
       <div class="mb-5">
+        <div class="mb-2 flex items-center justify-between gap-2">
+          <div>
+            <div class="text-xs font-semibold uppercase tracking-wide text-slate-300">sections</div>
+            <div class="mt-0.5 text-[11px] text-slate-500">Adds additional trimable range, sections are stitched in order. Delete removes the highlighted section.</div>
+          </div>
+          <span class="rounded bg-gray-900/70 px-2 py-0.5 text-[11px] text-slate-400">{trimRanges.length}</span>
+        </div>
+
+        <div class="mb-3 max-h-28 space-y-1 overflow-auto">
+          {#each trimRanges as range, index}
+            <div class="flex items-center gap-1 rounded-md border {index === activeTrimRangeIndex ? 'border-sky-400/45 bg-sky-950/30' : 'border-gray-700/50 bg-gray-950/30'}">
+              <button
+                type="button"
+                class="min-w-0 flex-1 px-2 py-1.5 text-left text-[11px] focus:outline-none focus-visible:outline-none {index === activeTrimRangeIndex ? 'text-sky-100' : 'text-slate-300'}"
+                onclick={() => selectTrimRange(index)}
+              >
+                <span class="font-semibold">Section {index + 1}</span>
+                <span class="ml-1 text-slate-500">{formatTime(range.startTime)} – {formatTime(range.endTime)}</span>
+              </button>
+              <button
+                type="button"
+                class="mr-1 rounded px-1.5 py-1 text-[10px] text-red-300 hover:bg-red-950/50 focus:outline-none focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-30"
+                disabled={trimRanges.length <= 1}
+                aria-label={`Remove kept section ${index + 1}`}
+                onclick={() => removeTrimRange(index)}
+              >
+                Remove
+              </button>
+            </div>
+          {/each}
+        </div>
+
+        <button
+          type="button"
+          class="mb-3 w-full rounded-md border border-sky-500/30 bg-sky-950/20 px-2 py-2 text-xs text-sky-200 hover:bg-sky-900/30 focus:outline-none focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={!canAddTrimRange}
+          onclick={addTrimRange}
+        >
+          Add section at playhead (T)
+        </button>
+
         <div class="flex flex-col mb-3">
-          <label for="startTimeInput" class="font-medium text-teal-300 mb-1 text-xs uppercase tracking-wider">Start Time</label>
+          <label for="startTimeInput" class="font-medium text-teal-300 mb-1 text-xs uppercase tracking-wider">Active section start</label>
           <input
             type="text"
             id="startTimeInput"
@@ -92,7 +146,7 @@
           />
         </div>
         <div class="flex flex-col">
-          <label for="endTimeInput" class="font-medium text-amber-300 mb-1 text-xs uppercase tracking-wider">End Time</label>
+          <label for="endTimeInput" class="font-medium text-amber-300 mb-1 text-xs uppercase tracking-wider">Active section end</label>
           <input
             type="text"
             id="endTimeInput"

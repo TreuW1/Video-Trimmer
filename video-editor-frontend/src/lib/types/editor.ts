@@ -7,6 +7,12 @@ export type AudioMuteRange = {
   endTime: number;
 };
 
+/** A source-time interval that is kept in the exported video. */
+export type TrimRange = {
+  startTime: number;
+  endTime: number;
+};
+
 export type UploadQueueItem = {
   file: File | null;
   filePath: string | null;
@@ -31,6 +37,7 @@ export type VideoTrack = {
   endTimeManuallySet: boolean;
   selected: boolean;
   duration: number;
+  trimRanges?: TrimRange[];
   audioDetached?: boolean;
   audioWaveformHidden?: boolean;
   audioOutputMode?: AudioOutputMode;
@@ -79,6 +86,7 @@ export type LibraryClipState = {
   compressionMode?: string;
   volume?: number;
   endTimeManuallySet?: boolean;
+  trimRanges?: TrimRange[];
   audioDetached?: boolean;
   audioWaveformHidden?: boolean;
   audioOutputMode?: AudioOutputMode;

@@ -1,5 +1,5 @@
 import type { CompressionPreset, VideoTrack } from '$lib/types/editor';
-import { parseTime } from '$lib/utils/time';
+import { getTrackTrimRanges, sumTrimRangeDurations } from '$lib/utils/timeRanges';
 
 export function calculateExpectedOutputSize(options: {
   tracks: VideoTrack[];
@@ -48,15 +48,11 @@ export function calculateExpectedOutputSize(options: {
         break;
       }
 
-      const trackStartSeconds = parseTime(track.startTime);
-      const trackEndSeconds = parseTime(track.endTime);
-
-      if (isNaN(trackStartSeconds) || isNaN(trackEndSeconds) || trackEndSeconds <= trackStartSeconds) {
+      const trimDurationSeconds = sumTrimRangeDurations(getTrackTrimRanges(track));
+      if (trimDurationSeconds <= 0) {
         hasValidTracks = false;
         break;
       }
-
-      const trimDurationSeconds = trackEndSeconds - trackStartSeconds;
       let originalDurationSeconds = track.duration;
       if (originalDurationSeconds <= 0) {
         originalDurationSeconds = (fileSize * 8) / (8 * 1024 * 1024);
@@ -92,7 +88,10 @@ export function calculateExpectedOutputSize(options: {
     return '';
   }
 
-  const trimDurationSeconds = endTimeSeconds - startTimeSeconds;
+  const storedTrimDuration = sumTrimRangeDurations(getTrackTrimRanges(activeTrack));
+  const trimDurationSeconds = storedTrimDuration > 0
+    ? storedTrimDuration
+    : endTimeSeconds - startTimeSeconds;
   const originalDurationSeconds = duration;
   if (originalDurationSeconds <= 0) {
     return '';

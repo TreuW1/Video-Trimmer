@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "VideoTrimmer"
-version = "1.0.5"
+version = "1.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "log",

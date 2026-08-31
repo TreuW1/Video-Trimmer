@@ -74,6 +74,7 @@ function collectDependencies(packageName, seen = new Set()) {
 removeDir(distDir);
 fs.mkdirSync(targetNodeModules, { recursive: true });
 fs.copyFileSync(path.join(rootDir, 'server.cjs'), path.join(distDir, 'server.cjs'));
+fs.copyFileSync(path.join(rootDir, 'time-ranges.cjs'), path.join(distDir, 'time-ranges.cjs'));
 fs.copyFileSync(path.join(rootDir, 'update-check.cjs'), path.join(distDir, 'update-check.cjs'));
 fs.copyFileSync(path.join(rootDir, 'VERSION'), path.join(distDir, 'VERSION'));
 fs.copyFileSync(path.join(rootDir, 'upload-limits.json'), path.join(distDir, 'upload-limits.json'));

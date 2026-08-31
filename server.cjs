@@ -1,6 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const crypto = require('crypto');
+const { normalizeTimeRanges, normalizeTrimRanges } = require('./time-ranges.cjs');
 const path = require('path');
 const fs = require('fs').promises;
 const fsSync = require('fs');
@@ -83,6 +84,10 @@ const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const OUTPUT_DIR = path.join(DATA_DIR, 'outputs');
 const TEMP_DIR = path.join(DATA_DIR, 'temp');
 const CUSTOM_COMPRESSION_PRESETS_PATH = path.join(DATA_DIR, 'custom-compression-presets.json');
+// Matches the frontend's highest-detail waveform source. The client renders a
+// fixed-size window from these bins, so increasing zoom adds detail without
+// increasing the number of SVG elements on screen.
+const MAX_WAVEFORM_POINTS = 15360;
 const SCOPES_FILE = process.env.VIDEO_TRIMMER_SCOPES_FILE
     ? path.resolve(process.env.VIDEO_TRIMMER_SCOPES_FILE)
     : null;
@@ -220,14 +225,18 @@ function generateWaveformPeaks(inputPath, duration, pointCount) {
             );
             const audibleLevels = rmsValues.filter((level) => level > 0).sort((a, b) => a - b);
             const referenceLevel = audibleLevels.length > 0
-                ? audibleLevels[Math.min(audibleLevels.length - 1, Math.floor(audibleLevels.length * 0.95))]
+                ? audibleLevels[Math.floor((audibleLevels.length - 1) * 0.99)]
                 : 0;
-            const normalizationLevel = Math.max(referenceLevel, 0.00001);
+            // Leave 6 dB above the 99th-percentile body instead of clipping
+            // every louder bin to the same value. This preserves differences
+            // inside loud passages while the logarithmic scale keeps quiet
+            // passages readable.
+            const normalizationLevel = Math.max(referenceLevel * 2, 0.00001);
             resolve(rmsValues.map((level) => {
                 if (level <= 0) return 0;
                 const decibels = 20 * Math.log10(level / normalizationLevel);
                 const normalized = Math.max(0, Math.min(1, (decibels + 48) / 48));
-                return Math.round(Math.pow(normalized, 0.85) * 1000) / 1000;
+                return Math.round(Math.pow(normalized, 0.85) * 10000) / 10000;
             }));
         });
     });
@@ -285,6 +294,7 @@ function buildEncodingArgs(input, output, {
 }
 
 const AUDIO_OUTPUT_MODES = new Set(['keep', 'volume', 'mute', 'extract']);
+const MAX_TRIM_SEGMENTS_PER_JOB = 100;
 
 function normalizeAudioOutputOptions(audioMode, audioVolume) {
     const mode = AUDIO_OUTPUT_MODES.has(audioMode) ? audioMode : 'keep';
@@ -296,30 +306,7 @@ function normalizeAudioOutputOptions(audioMode, audioVolume) {
 }
 
 function normalizeAudioMuteRanges(ranges, clipStart, clipEnd) {
-    if (!Array.isArray(ranges)) return [];
-
-    const normalized = ranges
-        .map((range) => ({
-            startTime: Number(range?.startTime),
-            endTime: Number(range?.endTime)
-        }))
-        .filter((range) => Number.isFinite(range.startTime) && Number.isFinite(range.endTime))
-        .map((range) => ({
-            startTime: Math.max(clipStart, range.startTime),
-            endTime: Math.min(clipEnd, range.endTime)
-        }))
-        .filter((range) => range.endTime - range.startTime >= 0.001)
-        .sort((left, right) => left.startTime - right.startTime);
-
-    return normalized.reduce((merged, range) => {
-        const previous = merged[merged.length - 1];
-        if (previous && range.startTime <= previous.endTime + 0.001) {
-            previous.endTime = Math.max(previous.endTime, range.endTime);
-        } else {
-            merged.push({ ...range });
-        }
-        return merged;
-    }, []);
+    return normalizeTimeRanges(ranges, { minimum: clipStart, maximum: clipEnd });
 }
 
 function makeRelativeAudioMuteRanges(ranges, clipStart) {
@@ -1566,7 +1553,7 @@ app.get('/waveform/:videoId', async (req, res) => {
 
     const requestedPoints = Number.parseInt(req.query.points, 10);
     const pointCount = Number.isFinite(requestedPoints)
-        ? Math.max(64, Math.min(1200, requestedPoints))
+        ? Math.max(64, Math.min(MAX_WAVEFORM_POINTS, requestedPoints))
         : 480;
     const cacheKey = `${req.params.videoId}:${pointCount}`;
     const cached = waveformCache.get(cacheKey);
@@ -1603,9 +1590,25 @@ app.post('/trim', express.json(), async (req, res) => {
         );
         const processingCompressionMode = audioMode === 'extract' ? 'original' : compressionMode;
         
-        // Multi-track support
-        if (Array.isArray(tracks) && tracks.length > 1) {
-            const combinedCompressionMode = compressionMode;
+        // A segmented request covers both multiple source tracks and multiple
+        // kept sections from one source. Each source range is normalized into
+        // a concat-safe segment and the resulting segments are stitched in the
+        // same order as the request's tracks (and chronological range order).
+        const segmentTrackRequests = Array.isArray(tracks) && tracks.length > 0
+            ? tracks
+            : Array.isArray(req.body.trimRanges) && req.body.trimRanges.length > 1
+                ? [{
+                    videoId,
+                    startTime,
+                    endTime,
+                    trimRanges: req.body.trimRanges,
+                    audioMode,
+                    audioMuteRanges: req.body.audioMuteRanges
+                }]
+                : null;
+
+        if (segmentTrackRequests) {
+            const combinedCompressionMode = processingCompressionMode;
             // Validate compression mode
             if (!COMPRESSION_MODES[combinedCompressionMode]) {
                 return res.status(400).json({ 
@@ -1615,7 +1618,7 @@ app.post('/trim', express.json(), async (req, res) => {
             }
             // Validate and build tracks array for job
             const jobTracks = [];
-            for (const t of tracks) {
+            for (const t of segmentTrackRequests) {
                 if (!t.videoId) {
                     return res.status(400).json({ error: 'Each track must have a videoId' });
                 }
@@ -1623,22 +1626,33 @@ app.post('/trim', express.json(), async (req, res) => {
                 if (!videoInfo) {
                     return res.status(404).json({ error: 'One of the tracks was not found. Please upload all videos first.' });
                 }
-                if (typeof t.startTime !== 'number' || typeof t.endTime !== 'number' || t.startTime >= t.endTime) {
-                    return res.status(400).json({ error: 'Invalid start/end time in one of the tracks' });
+                const trackTrimRanges = normalizeTrimRanges(t.trimRanges, t.startTime, t.endTime);
+                if (trackTrimRanges.length === 0) {
+                    return res.status(400).json({ error: 'Invalid kept section in one of the tracks' });
                 }
-                jobTracks.push({
-                    inputPath: videoInfo.path,
-                    startTime: t.startTime,
-                    endTime: t.endTime,
-                    // Audio extraction is a single-clip output mode. In a
-                    // combined video it means "keep this clip's audio".
-                    audioMode: normalizeAudioOutputOptions(t.audioMode ?? t.audioOutputMode).mode === 'mute'
-                        ? 'mute'
-                        : 'keep',
-                    audioMuteRanges: normalizeAudioMuteRanges(t.audioMuteRanges, t.startTime, t.endTime)
-                });
+                if (jobTracks.length + trackTrimRanges.length > MAX_TRIM_SEGMENTS_PER_JOB) {
+                    return res.status(400).json({
+                        error: `A trim job can contain at most ${MAX_TRIM_SEGMENTS_PER_JOB} kept sections`
+                    });
+                }
+                const trackAudioMode = normalizeAudioOutputOptions(t.audioMode ?? t.audioOutputMode).mode;
+                for (const trimRange of trackTrimRanges) {
+                    jobTracks.push({
+                        inputPath: videoInfo.path,
+                        startTime: trimRange.startTime,
+                        endTime: trimRange.endTime,
+                        // Extraction is applied once after all segments have
+                        // been joined; per-track mute settings remain intact.
+                        audioMode: trackAudioMode === 'mute' ? 'mute' : 'keep',
+                        audioMuteRanges: normalizeAudioMuteRanges(
+                            t.audioMuteRanges,
+                            trimRange.startTime,
+                            trimRange.endTime
+                        )
+                    });
+                }
             }
-            const outputTarget = await createOutputTarget(outputDirectory, combinedCompressionMode, outputFilename, 'keep');
+            const outputTarget = await createOutputTarget(outputDirectory, combinedCompressionMode, outputFilename, audioMode);
             const compressionConfig = COMPRESSION_MODES[combinedCompressionMode];
             const jobId = crypto.randomUUID();
             const createdAt = new Date();
@@ -1651,10 +1665,13 @@ app.post('/trim', express.json(), async (req, res) => {
                 outputDirectory: outputTarget.outputDirectory,
                 compressionMode: combinedCompressionMode,
                 compressionName: compressionConfig.name,
-                hardwareAcceleration,
-                audioMode: 'keep',
+                hardwareAcceleration: audioMode === 'extract' ? false : hardwareAcceleration,
+                audioMode,
                 audioVolume,
-                workingOutputPath: outputTarget.outputPath,
+                audioMuteRanges: [],
+                workingOutputPath: audioMode === 'extract'
+                    ? path.join(TEMP_DIR, `audio_source_${jobId}.mp4`)
+                    : outputTarget.outputPath,
                 progress: 0,
                 progressMessage: 'Starting...',
                 createdAt: createdAt,
@@ -1667,10 +1684,9 @@ app.post('/trim', express.json(), async (req, res) => {
                 message: 'Combining and processing tracks',
                 compressionMode: combinedCompressionMode,
                 compressionName: compressionConfig.name,
-                hardwareAcceleration,
-                audioMode: 'keep',
+                hardwareAcceleration: audioMode === 'extract' ? false : hardwareAcceleration,
+                audioMode,
                 audioVolume,
-                ignoredAudioMode: audioMode === 'extract' ? 'extract' : null,
                 estimatedTime: compressionConfig.estimatedTime,
                 qualityLevel: compressionConfig.qualityLevel
             });
@@ -1686,7 +1702,7 @@ app.post('/trim', express.json(), async (req, res) => {
             return res.status(404).json({ error: 'Video not found. Please upload the video first.' });
         }
 
-        if (startTime == null || endTime == null) {
+        if ((startTime == null || endTime == null) && !Array.isArray(req.body.trimRanges)) {
             return res.status(400).json({ error: 'Start time and end time are required' });
         }
 
@@ -1698,8 +1714,11 @@ app.post('/trim', express.json(), async (req, res) => {
             });
         }
 
-        const startSeconds = Number.parseFloat(startTime);
-        const endSeconds = Number.parseFloat(endTime);
+        const singleTrimRanges = normalizeTrimRanges(req.body.trimRanges, startTime, endTime);
+        if (singleTrimRanges.length !== 1) {
+            return res.status(400).json({ error: 'A valid kept section is required' });
+        }
+        const [{ startTime: startSeconds, endTime: endSeconds }] = singleTrimRanges;
 
         if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds)) {
             return res.status(400).json({ error: 'Start time and end time must be valid numbers' });

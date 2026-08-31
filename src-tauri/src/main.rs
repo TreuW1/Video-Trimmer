@@ -354,6 +354,47 @@ async fn pick_video_files(
         .collect())
 }
 
+#[command]
+fn authorize_dropped_video_files(
+    app: tauri::AppHandle,
+    state: State<'_, BackendSecurityState>,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut authorized_paths = Vec::new();
+
+    for path in paths {
+        let canonical = validate_library_video_path(&path)?;
+
+        // Tauri adds native file-drop targets to the asset protocol scope before
+        // emitting the drop event to the webview. Requiring that grant here keeps
+        // this command from becoming a general-purpose arbitrary-path escape.
+        if !app.asset_protocol_scope().is_allowed(&canonical) {
+            return Err("File was not granted by a native drag-and-drop event".to_string());
+        }
+
+        authorize_file(&app, &canonical)?;
+        authorized_paths.push(canonical);
+    }
+
+    {
+        let mut scopes = state
+            .scopes
+            .lock()
+            .map_err(|_| "Filesystem scope state is unavailable".to_string())?;
+        for path in &authorized_paths {
+            if !scopes.read_files.contains(path) {
+                scopes.read_files.push(path.clone());
+            }
+        }
+    }
+    write_scope_file(&state)?;
+
+    Ok(authorized_paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect())
+}
+
 fn authorize_picked_directory(
     app: &tauri::AppHandle,
     state: &BackendSecurityState,
@@ -1115,6 +1156,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_backend_auth_token,
             pick_video_files,
+            authorize_dropped_video_files,
             pick_library_directory,
             pick_output_directory,
             is_path_authorized,

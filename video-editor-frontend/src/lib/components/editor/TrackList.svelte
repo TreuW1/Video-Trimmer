@@ -169,12 +169,7 @@
           </button>
         </div>
 
-        <div class="flex items-center justify-between gap-2">
-          <div class="min-w-0 truncate text-xs text-gray-400">{trackName(track)}</div>
-          {#if track.audioDetached}
-            <span class="shrink-0 rounded border border-amber-400/25 bg-amber-950/25 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-amber-300">Audio detached</span>
-          {/if}
-        </div>
+        <div class="min-w-0 truncate text-xs text-gray-400">{trackName(track)}</div>
       </div>
     {/each}
   </div>

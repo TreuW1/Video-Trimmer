@@ -13,6 +13,8 @@ export type EditorKeybindActions = {
   toggleFullscreen: () => void;
   setCurrentAsStart: () => void;
   setCurrentAsEnd: () => void;
+  addTrimRange: () => void;
+  deleteTimelineSelection: () => void;
   playFromStart: () => void;
   togglePlayback: () => void;
   stepFrame: (direction: -1 | 1) => void;
@@ -21,6 +23,8 @@ export type EditorKeybindActions = {
 const EDITOR_SHORTCUT_CODES = new Set([
   'KeyS',
   'KeyE',
+  'KeyT',
+  'Delete',
   'KeyP',
   'Space',
   'ArrowLeft',
@@ -79,6 +83,12 @@ export function handleEditorKeybind(
       break;
     case 'KeyE':
       actions.setCurrentAsEnd();
+      break;
+    case 'KeyT':
+      actions.addTrimRange();
+      break;
+    case 'Delete':
+      actions.deleteTimelineSelection();
       break;
     case 'KeyP':
       actions.playFromStart();

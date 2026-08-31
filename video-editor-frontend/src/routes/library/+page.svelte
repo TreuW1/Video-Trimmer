@@ -56,6 +56,7 @@
   type LibraryClipState = {
     startTime?: string;
     endTime?: string;
+    trimRanges?: Array<{ startTime: number; endTime: number }>;
     compressionMode?: string;
     volume?: number;
     endTimeManuallySet?: boolean;
@@ -853,9 +854,15 @@
     const videoEl = videoPreviews[videoPath];
     if (!videoEl || hoveredVideo !== videoPath) return;
 
-    const { start, end } = getRememberedPreviewRange(videoPath, videoEl.duration);
-    if (end !== null && videoEl.currentTime >= end) {
-      videoEl.currentTime = start;
+    const ranges = getRememberedPreviewRanges(videoPath, videoEl.duration);
+    if (ranges.length === 0) return;
+    let rangeIndex = -1;
+    for (let index = 0; index < ranges.length; index++) {
+      if (videoEl.currentTime >= ranges[index].start - 0.01) rangeIndex = index;
+    }
+    const range = rangeIndex >= 0 ? ranges[rangeIndex] : null;
+    if (range && videoEl.currentTime >= range.end - 0.005) {
+      videoEl.currentTime = ranges[rangeIndex + 1]?.start ?? ranges[0].start;
     }
   }
 
@@ -1115,21 +1122,49 @@
     return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
-  function getRememberedPreviewRange(videoPath: string, duration = 0): { start: number; end: number | null } {
+  function getRememberedPreviewRanges(videoPath: string, duration = 0): Array<{ start: number; end: number }> {
     const state = getLibraryClipState(videoPath);
+    if (Array.isArray(state?.trimRanges)) {
+      const ranges = state.trimRanges
+        .map((range) => ({
+          start: Math.max(0, Number(range?.startTime)),
+          end: duration > 0
+            ? Math.min(duration, Number(range?.endTime))
+            : Number(range?.endTime)
+        }))
+        .filter((range) => Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start)
+        .sort((left, right) => left.start - right.start);
+      if (ranges.length > 0) return ranges;
+    }
+
     const start = Math.max(0, parseTime(state?.startTime ?? ''));
     const rememberedEnd = parseTime(state?.endTime ?? '');
     const end = rememberedEnd > start ? rememberedEnd : null;
 
-    return {
+    if (end === null) return [];
+    return [{
       start: duration > 0 ? Math.min(start, duration) : start,
-      end: end && duration > 0 ? Math.min(end, duration) : end
+      end: duration > 0 ? Math.min(end, duration) : end
+    }];
+  }
+
+  function getRememberedPreviewRange(videoPath: string, duration = 0): { start: number; end: number | null } {
+    const ranges = getRememberedPreviewRanges(videoPath, duration);
+    if (ranges.length > 0) {
+      return { start: ranges[0].start, end: ranges[ranges.length - 1].end };
+    }
+
+    return {
+      start: 0,
+      end: null
     };
   }
 
   function getDisplayDuration(video: VideoFile): number {
-    const range = getRememberedPreviewRange(video.path, video.duration);
-    return range.end !== null && range.end > range.start ? range.end - range.start : video.duration;
+    const ranges = getRememberedPreviewRanges(video.path, video.duration);
+    return ranges.length > 0
+      ? ranges.reduce((total, range) => total + (range.end - range.start), 0)
+      : video.duration;
   }
   
   // Keyboard shortcuts

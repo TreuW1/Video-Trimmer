@@ -5,6 +5,7 @@
   import FileDropOverlay from '$lib/components/editor/FileDropOverlay.svelte';
   import LoadingOverlay from '$lib/components/editor/LoadingOverlay.svelte';
   import OutputOptionsModal from '$lib/components/editor/OutputOptionsModal.svelte';
+  import PlaybackSpeedControl from '$lib/components/editor/PlaybackSpeedControl.svelte';
   import Timeline from '$lib/components/editor/Timeline.svelte';
   import TrackList from '$lib/components/editor/TrackList.svelte';
   import TrimPanel from '$lib/components/editor/TrimPanel.svelte';
@@ -36,6 +37,7 @@
   import { calculateExpectedOutputSize } from '$lib/utils/estimatedOutputSize';
   import { API_BASE, apiFetch, getBackendToken } from '$lib/backendApi';
   import {
+    adjustTimelineScrubConfigForZoom,
     createAdaptiveTimelineScrubConfig,
     createTimelineScrubThrottle,
     preciseVideoSeek,
@@ -43,7 +45,21 @@
     timeFromTimelineClientX,
     trySmoothVideoSeek
   } from '$lib/utils/timelineScrub';
+  import {
+    createTimelineViewport,
+    getWaveformSourcePointCount,
+    panTimelineViewport,
+    zoomTimelineViewport,
+    type TimelineViewport
+  } from '$lib/utils/timelineViewport';
   import { handleEditorKeybind } from '$lib/utils/editorKeybinds';
+  import {
+    findClosestTrimRangeIndex,
+    findAvailableTrimRange,
+    getTrackTrimRanges,
+    normalizeTrimRanges,
+    sumTrimRangeDurations
+  } from '$lib/utils/timeRanges';
   import uploadLimits from '../../../upload-limits.json';
    
   const fetch = apiFetch;
@@ -61,7 +77,11 @@
       : null;
   type DisplayCompressionPreset = CompressionPreset & { hidden?: boolean };
   type ChangeVideoSource = 'file' | 'library';
-  type WaveformData = { peaks: number[]; hasAudio: boolean | null };
+  type WaveformData = {
+    peaks: number[];
+    hasAudio: boolean | null;
+    pointCount: number;
+  };
   type CompletedOutput = {
     outputSize: string;
     outputPath: string;
@@ -102,15 +122,25 @@
   let endTime = $state("00:00:00.000");
   let currentTime = $state(0);
   let duration = $state(0);
+  let activeTrimRangeIndex = $state(0);
+  let selectedAudioMuteRangeIndex = $state<number | null>(null);
+  let timelineViewport = $state<TimelineViewport>(createTimelineViewport());
 
   // Derived time values
   let totalDuration = $derived(formatTime(duration));
-  let trimDuration = $derived(formatTime(Math.max(0, parseTime(endTime) - parseTime(startTime))));
+  let trimDuration = $derived.by(() => {
+    const activeTrack = tracks.find((track) => track.id === activeTrackId);
+    const storedDuration = activeTrack
+      ? sumTrimRangeDurations(getTrackTrimRanges(activeTrack))
+      : 0;
+    return formatTime(
+      storedDuration > 0
+        ? storedDuration
+        : Math.max(0, parseTime(endTime) - parseTime(startTime))
+    );
+  });
   let startTimeSeconds = $derived(parseTime(startTime));
   let endTimeSeconds = $derived(parseTime(endTime));
-  let startPercent = $derived(duration > 0 ? (startTimeSeconds / duration) * 100 : 0);
-  let endPercent = $derived(duration > 0 ? (endTimeSeconds / duration) * 100 : 100);
-  let trimPercent = $derived(endPercent - startPercent);
 
   // UI state
   let statusMessage = $state("");
@@ -127,6 +157,7 @@
   let progressPercent = $state(0);
   let isPlaying = $state(false);
   let volume = $state(1);
+  let playbackSpeed = $state(1);
   let showVolume = $state(false);
   let isFullscreen = $state(false);
 
@@ -170,6 +201,8 @@
   let isDraggingStart = $state(false);
   let isDraggingEnd = $state(false);
   let isTimelinePlayheadScrubbing = $state(false);
+  let timelineScrubStartClientX = 0;
+  let timelineScrubHasMoved = false;
   let scrubPointerTime = $state(0); 
   /**
    * When the user releases the timeline, keep the UI locked to their intended
@@ -191,11 +224,13 @@
     if (isDraggingEnd) return endTimeSeconds;
     return currentTime;
   });
-  let timelineUiPercent = $derived(duration > 0 ? (timelineUiTime / duration) * 100 : 0);
   let timelineScrubConfig = $derived.by(() => {
     const activeTrack = tracks.find((track) => track.id === activeTrackId);
     const fileSizeBytes = activeTrack?.videoFile?.size ?? activeTrack?.fileSizeBytes;
-    return createAdaptiveTimelineScrubConfig(fileSizeBytes, duration);
+    return adjustTimelineScrubConfigForZoom(
+      createAdaptiveTimelineScrubConfig(fileSizeBytes, duration),
+      timelineViewport.zoom
+    );
   });
 
   // Upload state
@@ -222,6 +257,7 @@
   let pendingAudioOutputMode = $state<AudioOutputMode | null>(null);
   let waveformByVideoId = $state<Record<string, WaveformData>>({});
   let waveformLoadingVideoIds = $state<string[]>([]);
+  let waveformFailedVideoIds = $state<string[]>([]);
   let compressionModes = $state<DisplayCompressionPreset[]>([]);
   let expectedOutputSize = $state('');
   let outputDirectory = $state('');
@@ -415,6 +451,9 @@
         if (!url || loadToken !== activeVideoLoadToken || activeTrackId !== track.id || videoPlayer !== player) {
           return;
         }
+        // Keep the media-fragment URL used by the inactive-track preloader.
+        // It lets the browser reuse the metadata and target-time data it has
+        // already requested when this track becomes active.
         const playbackUrl = videoUrlAtStartTime(url, trackStart);
 
         const handleLoadedMetadata = () => {
@@ -431,7 +470,20 @@
           }
 
           const targetTime = Math.min(parseTime(track.startTime), Math.max(0, player.duration - 0.01));
+          let trackStartFallbackTimeout = 0;
+          let handleTrackStartSeeked: (() => void) | null = null;
+          const cleanupTrackStartSeek = () => {
+            if (handleTrackStartSeeked) {
+              player.removeEventListener('seeked', handleTrackStartSeeked);
+              handleTrackStartSeeked = null;
+            }
+            if (trackStartFallbackTimeout) {
+              clearTimeout(trackStartFallbackTimeout);
+              trackStartFallbackTimeout = 0;
+            }
+          };
           const revealAtStart = () => {
+            cleanupTrackStartSeek();
             if (loadToken !== activeVideoLoadToken || activeTrackId !== track.id || videoPlayer !== player) {
               return;
             }
@@ -439,11 +491,45 @@
             revealLoadedVideo(loadToken, player);
           };
 
-          if (Math.abs(player.currentTime - targetTime) <= 0.05) {
+          if (Math.abs(player.currentTime - targetTime) <= 0.05 && !player.seeking) {
             revealAtStart();
           } else {
-            player.addEventListener('seeked', revealAtStart, { once: true });
-            player.currentTime = targetTime;
+            handleTrackStartSeeked = () => {
+              if (loadToken !== activeVideoLoadToken || activeTrackId !== track.id || videoPlayer !== player) {
+                cleanupTrackStartSeek();
+                return;
+              }
+
+              if (Math.abs(player.currentTime - targetTime) <= 0.05) {
+                revealAtStart();
+                return;
+              }
+
+              // A fragment seek should land at the target. If this WebView did
+              // not honor it, make one explicit fallback seek after it settles.
+              player.addEventListener('seeked', revealAtStart, { once: true });
+              player.currentTime = targetTime;
+            };
+
+            player.addEventListener('seeked', handleTrackStartSeeked, { once: true });
+            trackStartFallbackTimeout = window.setTimeout(() => {
+              trackStartFallbackTimeout = 0;
+              if (loadToken !== activeVideoLoadToken || activeTrackId !== track.id || videoPlayer !== player) {
+                cleanupTrackStartSeek();
+                return;
+              }
+
+              if (Math.abs(player.currentTime - targetTime) <= 0.05) {
+                if (!player.seeking) revealAtStart();
+                return;
+              }
+
+              // Give the native media-fragment seek one frame to start. Only
+              // fall back when no seek is in flight, avoiding duplicate decode.
+              if (!player.seeking) {
+                player.currentTime = targetTime;
+              }
+            }, 50);
           }
         };
 
@@ -541,21 +627,29 @@
     currentTime = player.currentTime;
     isPlaying = !player.paused;
 
-    // Normal playback follows the selected trim range. Seeking remains unrestricted,
-    // so the playhead can still be dragged before the start or after the end marker.
-    if (
-      shouldStopPlaybackAtTrimEnd &&
-      !player.paused &&
-      Number.isFinite(endTimeSeconds) &&
-      endTimeSeconds > startTimeSeconds &&
-      currentTime >= endTimeSeconds
-    ) {
-      player.pause();
-      if (Math.abs(player.currentTime - endTimeSeconds) > 0.01) {
-        player.currentTime = endTimeSeconds;
+    // Export joins kept sections, so playback mirrors that result by skipping
+    // excluded gaps. Timeline seeking itself remains unrestricted.
+    if (shouldStopPlaybackAtTrimEnd && !player.paused && activeTrimRanges.length > 0) {
+      let rangeIndex = -1;
+      for (let index = 0; index < activeTrimRanges.length; index++) {
+        if (currentTime >= activeTrimRanges[index].startTime - 0.01) rangeIndex = index;
       }
-      currentTime = endTimeSeconds;
-      isPlaying = false;
+
+      const currentRange = rangeIndex >= 0 ? activeTrimRanges[rangeIndex] : null;
+      if (currentRange && currentTime >= currentRange.endTime - 0.005) {
+        const nextRange = activeTrimRanges[rangeIndex + 1];
+        if (nextRange) {
+          player.currentTime = nextRange.startTime;
+          currentTime = nextRange.startTime;
+        } else {
+          player.pause();
+          if (Math.abs(player.currentTime - currentRange.endTime) > 0.01) {
+            player.currentTime = currentRange.endTime;
+          }
+          currentTime = currentRange.endTime;
+          isPlaying = false;
+        }
+      }
     }
 
     // If we were "latched" to a pending UI time, clear it once the player has landed.
@@ -601,14 +695,35 @@
     event.preventDefault();
     const timeline = event.currentTarget as HTMLElement;
     const rect = timeline.getBoundingClientRect();
-    const t = timeFromTimelineClientX(event.clientX, rect, duration);
+    const t = timeFromTimelineClientX(event.clientX, rect, duration, timelineViewport);
+    // A manual seek is unrestricted, including excluded gaps. Following kept
+    // sections resumes the next time playback is explicitly started.
+    shouldStopPlaybackAtTrimEnd = false;
     isTimelinePlayheadScrubbing = true;
+    timelineScrubStartClientX = event.clientX;
+    timelineScrubHasMoved = false;
     scrubPointerTime = t;
     pendingTimelineUiTime = null;
     resetTimelineScrubThrottle(playheadScrubThrottle);
-    safeVideoOperation((player) => {
-      smoothTimelineSeek(player, t, playheadScrubThrottle);
-    });
+  }
+
+  function handleTimelineZoom(wheelDeltaPixels: number, pointerRatio: number): void {
+    if (isTimelinePlayheadScrubbing || isDraggingStart || isDraggingEnd) return;
+    timelineViewport = zoomTimelineViewport(
+      timelineViewport,
+      duration,
+      pointerRatio,
+      wheelDeltaPixels
+    );
+  }
+
+  function handleTimelinePan(startTime: number): void {
+    if (isTimelinePlayheadScrubbing || isDraggingStart || isDraggingEnd) return;
+    timelineViewport = panTimelineViewport(timelineViewport, duration, startTime);
+  }
+
+  function resetTimelineZoom(): void {
+    timelineViewport = createTimelineViewport();
   }
 
   // Track management state
@@ -617,6 +732,15 @@
   let activeTrackId = $state<string | null>(null);
 
   let activeTrackForAudio = $derived(tracks.find((track) => track.id === activeTrackId));
+  let activeTrimRanges = $derived(
+    activeTrackForAudio ? getTrackTrimRanges(activeTrackForAudio) : []
+  );
+  let closestTrimRangeIndex = $derived(
+    findClosestTrimRangeIndex(activeTrimRanges, timelineUiTime)
+  );
+  let canAddTrimRange = $derived(
+    findAvailableTrimRange(activeTrimRanges, timelineUiTime, duration) !== null
+  );
   let activeAudioDetached = $derived(activeTrackForAudio?.audioDetached ?? false);
   let activeAudioMuteRanges = $derived(normalizeAudioMuteRanges(activeTrackForAudio?.audioMuteRanges));
   let activeAudioWaveformHidden = $derived(
@@ -629,38 +753,78 @@
   );
   let waveformPeaks = $derived(activeWaveform?.peaks ?? []);
   let waveformHasAudio = $derived(activeWaveform?.hasAudio ?? null);
-  let waveformLoading = $derived(
-    !!activeTrackForAudio?.uploadedVideoId && waveformLoadingVideoIds.includes(activeTrackForAudio.uploadedVideoId)
+  let desiredWaveformPointCount = $derived(
+    getWaveformSourcePointCount(timelineViewport.zoom)
   );
+  let waveformLoading = $derived(
+    !!activeTrackForAudio?.uploadedVideoId &&
+      !activeWaveform &&
+      waveformLoadingVideoIds.includes(activeTrackForAudio.uploadedVideoId)
+  );
+
+  function activateClosestTrimRange(time: number): void {
+    const track = tracks.find((candidate) => candidate.id === activeTrackId);
+    if (!track) return;
+    const ranges = getTrackTrimRanges(track);
+    const closestIndex = findClosestTrimRangeIndex(ranges, time);
+    const closestRange = ranges[closestIndex];
+    if (!closestRange || closestIndex === activeTrimRangeIndex) return;
+
+    activeTrimRangeIndex = closestIndex;
+    startTime = formatTime(closestRange.startTime);
+    endTime = formatTime(closestRange.endTime);
+  }
+
+  $effect(() => {
+    const playheadTime = timelineUiTime;
+    const closestIndex = closestTrimRangeIndex;
+    if (isDraggingStart || isDraggingEnd || closestIndex < 0) return;
+    activateClosestTrimRange(playheadTime);
+  });
 
   $effect(() => {
     if (!browser) return;
     const videoId = activeTrackForAudio?.uploadedVideoId;
+    const cachedWaveform = videoId ? waveformByVideoId[videoId] : undefined;
+    const requestedPointCount = desiredWaveformPointCount;
     if (
       !videoId ||
       activeAudioWaveformHidden ||
-      waveformByVideoId[videoId] ||
+      cachedWaveform?.hasAudio === false ||
+      (cachedWaveform?.pointCount ?? 0) >= requestedPointCount ||
+      waveformFailedVideoIds.includes(videoId) ||
       waveformLoadingVideoIds.includes(videoId)
     ) return;
 
     waveformLoadingVideoIds = [...waveformLoadingVideoIds, videoId];
-    void fetch(`${API_BASE}/waveform/${encodeURIComponent(videoId)}?points=480`)
+    void fetch(
+      `${API_BASE}/waveform/${encodeURIComponent(videoId)}?points=${requestedPointCount}`
+    )
       .then(async (response) => {
         if (!response.ok) throw new Error(`Waveform request failed (${response.status})`);
         const result = await response.json() as { peaks?: unknown; hasAudio?: unknown };
+        const peaks = Array.isArray(result.peaks)
+          ? result.peaks.filter((peak): peak is number =>
+              typeof peak === 'number' && Number.isFinite(peak)
+            )
+          : [];
+        const currentWaveform = waveformByVideoId[videoId];
+        if ((currentWaveform?.pointCount ?? 0) > requestedPointCount) return;
         waveformByVideoId = {
           ...waveformByVideoId,
           [videoId]: {
-            peaks: Array.isArray(result.peaks)
-              ? result.peaks.filter((peak): peak is number => typeof peak === 'number' && Number.isFinite(peak))
-              : [],
-            hasAudio: result.hasAudio === true
+            peaks,
+            hasAudio: result.hasAudio === true,
+            pointCount: peaks.length
           }
         };
+        if (result.hasAudio === true && peaks.length < requestedPointCount) {
+          waveformFailedVideoIds = [...new Set([...waveformFailedVideoIds, videoId])];
+        }
       })
       .catch((error) => {
         console.error('Could not load audio waveform:', error);
-        waveformByVideoId = { ...waveformByVideoId, [videoId]: { peaks: [], hasAudio: null } };
+        waveformFailedVideoIds = [...new Set([...waveformFailedVideoIds, videoId])];
       })
       .finally(() => {
         waveformLoadingVideoIds = waveformLoadingVideoIds.filter((id) => id !== videoId);
@@ -731,7 +895,9 @@
     }
     tracks = tracks.filter(track => track.id !== trackId);
     if (activeTrackId === trackId) {
-      activeTrackId = tracks[0]?.id || null;
+      activeTrackId = null;
+      const nextTrack = tracks[0];
+      if (nextTrack) setActiveTrack(nextTrack.id);
     }
   }
 
@@ -831,21 +997,18 @@
     playFromStartRequest++;
 
     saveTrackState();
-    
+
+    if (activeTrackId !== trackId) resetTimelineZoom();
+    selectedAudioMuteRangeIndex = null;
     activeTrackId = trackId;
     const track = tracks.find(t => t.id === trackId);
     if (track) {
       // Always update these values - the video loading effect will handle the rest
       videoFile = track.videoFile; // May be null for library videos (filePath is used instead)
-      startTime = track.startTime;
-      
-      // Always use the track's end time if it was manually set
-      if (track.endTimeManuallySet) {
-        endTime = track.endTime;
-      } else {
-        // Only update end time if it wasn't manually set
-        endTime = track.endTime;
-      }
+      const trimRanges = getTrackTrimRanges(track);
+      activeTrimRangeIndex = 0;
+      startTime = trimRanges[0] ? formatTime(trimRanges[0].startTime) : track.startTime;
+      endTime = trimRanges[0] ? formatTime(trimRanges[0].endTime) : track.endTime;
       
       volume = track.volume;
       selectedCompressionMode = track.compressionMode;
@@ -853,11 +1016,39 @@
     }
   }
 
+  function updateActiveTrimRange(track: VideoTrack): void {
+    const startTimeSeconds = parseTime(startTime);
+    const endTimeSeconds = parseTime(endTime);
+    if (
+      !Number.isFinite(startTimeSeconds) ||
+      !Number.isFinite(endTimeSeconds) ||
+      endTimeSeconds <= startTimeSeconds
+    ) return;
+
+    const existingRanges = getTrackTrimRanges(track);
+    const targetIndex = Math.min(activeTrimRangeIndex, Math.max(0, existingRanges.length - 1));
+    const nextRange = { startTime: startTimeSeconds, endTime: endTimeSeconds };
+    const candidateRanges = existingRanges.length > 0
+      ? existingRanges.map((range, index) => index === targetIndex ? nextRange : range)
+      : [nextRange];
+    const normalizedRanges = normalizeTrimRanges(candidateRanges, track.duration || duration);
+    if (normalizedRanges.length === 0) return;
+
+    const selectedIndex = normalizedRanges.findIndex(
+      (range) =>
+        range.startTime <= nextRange.startTime + 0.001 &&
+        range.endTime >= nextRange.endTime - 0.001
+    );
+    activeTrimRangeIndex = selectedIndex >= 0 ? selectedIndex : 0;
+    track.trimRanges = normalizedRanges;
+  }
+
   // Add a function to save track state when making changes
   function saveTrackState() {
     if (activeTrackId) {
       const trackIndex = tracks.findIndex(t => t.id === activeTrackId);
       if (trackIndex !== -1) {
+        updateActiveTrimRange(tracks[trackIndex]);
         tracks[trackIndex] = {
           ...tracks[trackIndex],
           startTime,
@@ -872,6 +1063,7 @@
           saveLibraryClipState(track.filePath, {
             startTime: track.startTime,
             endTime: track.endTime,
+            trimRanges: track.trimRanges,
             compressionMode: track.compressionMode,
             volume: track.volume,
             audioDetached: track.audioDetached,
@@ -883,6 +1075,80 @@
         }
       }
     }
+  }
+
+  function selectTrimRange(index: number, seekToStart = true): void {
+    const track = tracks.find((candidate) => candidate.id === activeTrackId);
+    if (!track) return;
+    saveTrackState();
+    const ranges = getTrackTrimRanges(track);
+    const range = ranges[index];
+    if (!range) return;
+
+    selectedAudioMuteRangeIndex = null;
+    activeTrimRangeIndex = index;
+    startTime = formatTime(range.startTime);
+    endTime = formatTime(range.endTime);
+
+    if (seekToStart) {
+      shouldStopPlaybackAtTrimEnd = true;
+      pendingTimelineUiTime = range.startTime;
+      safeVideoOperation((player) => {
+        preciseTimelineSeek(player, range.startTime, () => {
+          pendingTimelineUiTime = null;
+        });
+      });
+    }
+  }
+
+  function addTrimRange(): void {
+    const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+    if (trackIndex === -1) return;
+    saveTrackState();
+
+    const track = tracks[trackIndex];
+    const ranges = getTrackTrimRanges(track);
+    const range = findAvailableTrimRange(ranges, timelineUiTime, duration);
+    if (!range) {
+      displayStatus('Shorten a kept section to create room for another one.', 'error');
+      return;
+    }
+
+    selectedAudioMuteRangeIndex = null;
+    const normalizedRanges = normalizeTrimRanges([...ranges, range], duration);
+    track.trimRanges = normalizedRanges;
+    const addedRangeIndex = normalizedRanges.findIndex(
+      (candidate) =>
+        candidate.startTime <= range.startTime + 0.001 &&
+        candidate.endTime >= range.endTime - 0.001
+    );
+    activeTrimRangeIndex = Math.max(0, addedRangeIndex);
+    const selectedRange = normalizedRanges[activeTrimRangeIndex];
+    startTime = formatTime(selectedRange.startTime);
+    endTime = formatTime(selectedRange.endTime);
+    track.endTimeManuallySet = true;
+    saveTrackState();
+  }
+
+  function removeTrimRange(index: number): void {
+    const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
+    if (trackIndex === -1) return;
+    saveTrackState();
+
+    const track = tracks[trackIndex];
+    const ranges = getTrackTrimRanges(track);
+    if (ranges.length <= 1) return;
+    selectedAudioMuteRangeIndex = null;
+    const nextRanges = ranges.filter((_, rangeIndex) => rangeIndex !== index);
+    track.trimRanges = nextRanges;
+    activeTrimRangeIndex = Math.min(
+      index < activeTrimRangeIndex ? activeTrimRangeIndex - 1 : activeTrimRangeIndex,
+      nextRanges.length - 1
+    );
+    const selectedRange = nextRanges[activeTrimRangeIndex];
+    startTime = formatTime(selectedRange.startTime);
+    endTime = formatTime(selectedRange.endTime);
+    saveTrackState();
   }
 
   function setCompressionMode(mode: string): void {
@@ -913,6 +1179,7 @@
     if (!activeTrackId) return;
     const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
     if (trackIndex === -1) return;
+    if (hidden) selectedAudioMuteRangeIndex = null;
     tracks[trackIndex] = { ...tracks[trackIndex], audioWaveformHidden: hidden };
     saveTrackState();
   }
@@ -921,12 +1188,50 @@
     if (!activeTrackId) return;
     const trackIndex = tracks.findIndex((track) => track.id === activeTrackId);
     if (trackIndex === -1) return;
+    const selectedRange = selectedAudioMuteRangeIndex === null
+      ? null
+      : ranges[selectedAudioMuteRangeIndex];
+    const normalizedRanges = normalizeAudioMuteRanges(ranges);
     tracks[trackIndex] = {
       ...tracks[trackIndex],
       audioDetached: true,
-      audioMuteRanges: normalizeAudioMuteRanges(ranges)
+      audioMuteRanges: normalizedRanges
     };
+    if (selectedRange) {
+      const nextSelectedIndex = normalizedRanges.findIndex(
+        (range) =>
+          Math.abs(range.startTime - selectedRange.startTime) <= 0.001 &&
+          Math.abs(range.endTime - selectedRange.endTime) <= 0.001
+      );
+      selectedAudioMuteRangeIndex = nextSelectedIndex >= 0 ? nextSelectedIndex : null;
+    } else if (selectedAudioMuteRangeIndex !== null) {
+      selectedAudioMuteRangeIndex = null;
+    }
     saveTrackState();
+  }
+
+  function selectAudioMuteRange(index: number | null): void {
+    selectedAudioMuteRangeIndex =
+      index !== null && activeAudioMuteRanges[index] ? index : null;
+  }
+
+  function deleteTimelineSelection(): void {
+    if (
+      selectedAudioMuteRangeIndex !== null &&
+      activeAudioMuteRanges[selectedAudioMuteRangeIndex]
+    ) {
+      const indexToRemove = selectedAudioMuteRangeIndex;
+      selectedAudioMuteRangeIndex = null;
+      setAudioMuteRanges(
+        activeAudioMuteRanges.filter((_, rangeIndex) => rangeIndex !== indexToRemove)
+      );
+      displayStatus('Muted portion removed', 'success');
+      return;
+    }
+
+    if (activeTrimRanges.length <= 1 || closestTrimRangeIndex < 0) return;
+    removeTrimRange(closestTrimRangeIndex);
+    displayStatus('Kept section removed', 'success');
   }
 
   $effect(() => {
@@ -1058,7 +1363,16 @@
       return;
     }
 
-    await loadMultipleVideosFromPaths(videoPaths);
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const authorizedPaths = await invoke<string[]>('authorize_dropped_video_files', {
+        paths: videoPaths
+      });
+      await loadMultipleVideosFromPaths(authorizedPaths);
+    } catch (error) {
+      console.error('Could not authorize dropped video files:', error);
+      displayStatus('Failed to open the dropped video files.', 'error');
+    }
   }
 
   // Extract single file upload logic
@@ -1098,6 +1412,7 @@
             endTimeManuallySet: false,
             selected: false,
             duration: 0,
+            trimRanges: [],
             audioDetached: false,
             audioWaveformHidden: false,
             audioOutputMode: 'keep',
@@ -1140,6 +1455,8 @@
     uploadQueue = uploadQueue.filter(item => item.trackId !== previousTrack.id);
     tracks[trackIndex] = replacement;
     videoFile = replacement.videoFile;
+    resetTimelineZoom();
+    activeTrimRangeIndex = 0;
     startTime = replacement.startTime;
     endTime = replacement.endTime;
     volume = replacement.volume;
@@ -1171,6 +1488,7 @@
       endTimeManuallySet: false,
       selected: false,
       duration: 0,
+      trimRanges: [],
       audioDetached: false,
       audioWaveformHidden: false,
       audioOutputMode: 'keep',
@@ -1220,6 +1538,7 @@
       endTimeManuallySet: rememberedState?.endTimeManuallySet ?? !!rememberedState?.endTime,
       selected: false,
       duration: 0,
+      trimRanges: normalizeTrimRanges(rememberedState?.trimRanges),
       audioDetached: rememberedState?.audioDetached ?? false,
       audioWaveformHidden: rememberedState?.audioWaveformHidden ?? false,
       audioOutputMode: normalizeAudioOutputMode(rememberedState?.audioOutputMode),
@@ -1358,6 +1677,28 @@
     }
   }
 
+  function normalizePlaybackSpeed(speed: number): number {
+    return Math.max(0.25, Math.min(2, Math.round(speed * 20) / 20));
+  }
+
+  function setPlaybackSpeed(speed: number): void {
+    const normalizedSpeed = normalizePlaybackSpeed(speed);
+    playbackSpeed = normalizedSpeed;
+    safeVideoOperation((player) => {
+      player.defaultPlaybackRate = normalizedSpeed;
+      player.playbackRate = normalizedSpeed;
+    });
+  }
+
+  $effect(() => {
+    if (!videoPlayerReady) return;
+    const player = videoPlayer!;
+    const normalizedSpeed = normalizePlaybackSpeed(playbackSpeed);
+    if (Math.abs(player.playbackRate - normalizedSpeed) < 0.001) return;
+    player.defaultPlaybackRate = normalizedSpeed;
+    player.playbackRate = normalizedSpeed;
+  });
+
   // Video player manager effect with type safety
   $effect(() => {
     if (!videoPlayerReady) return;
@@ -1384,10 +1725,13 @@
         }
       },
       play: () => {
-        shouldStopPlaybackAtTrimEnd =
-          Number.isFinite(endTimeSeconds) &&
-          endTimeSeconds > startTimeSeconds &&
-          player.currentTime <= endTimeSeconds;
+        // Starting from an excluded gap is an intentional free-play action.
+        // Only follow and stitch kept sections when playback starts inside one.
+        shouldStopPlaybackAtTrimEnd = activeTrimRanges.some(
+          (range) =>
+            player.currentTime >= range.startTime - 0.01 &&
+            player.currentTime < range.endTime - 0.005
+        );
         isPlaying = true;
         startPlaybackTimeTracking(player);
       },
@@ -1399,6 +1743,9 @@
       volumechange: () => {
         volume = player.volume;
         saveTrackState();
+      },
+      ratechange: () => {
+        playbackSpeed = normalizePlaybackSpeed(player.playbackRate);
       }
     };
 
@@ -1422,15 +1769,16 @@
 
   function playFromStart(): void {
     safeVideoOperation((player) => {
-      if (startTimeSeconds >= endTimeSeconds) {
+      const firstRange = activeTrimRanges[0];
+      if (!firstRange) {
         displayStatus('Start time must be less than end time!', 'error');
         return;
       }
 
       const request = ++playFromStartRequest;
-      pendingTimelineUiTime = startTimeSeconds;
+      pendingTimelineUiTime = firstRange.startTime;
 
-      preciseTimelineSeek(player, startTimeSeconds, () => {
+      preciseTimelineSeek(player, firstRange.startTime, () => {
         if (request !== playFromStartRequest) return;
 
         pendingTimelineUiTime = null;
@@ -1777,10 +2125,7 @@
       console.log(`File "${fileName}" is already in the upload queue`);
       // If it's completed, link the existing videoId to this track
       if (existingInQueue.status === 'completed' && existingInQueue.videoId) {
-        const trackIndex = tracks.findIndex(t => t.id === trackId);
-        if (trackIndex !== -1) {
-          tracks[trackIndex].uploadedVideoId = existingInQueue.videoId;
-        }
+        updateTrackUploadedVideoId(trackId, existingInQueue.videoId);
         displayStatus(`Using existing upload for "${fileName}"`, 'success');
       }
       return;
@@ -1970,17 +2315,14 @@
 
   // Upload queue helper
   function updateTrackUploadedVideoId(trackId: string, videoId: string) {
-    const trackIndex = tracks.findIndex(t => t.id === trackId);
-    if (trackIndex !== -1) {
-      tracks[trackIndex].uploadedVideoId = videoId;
-    }
+    tracks = tracks.map((track) =>
+      track.id === trackId ? { ...track, uploadedVideoId: videoId } : track
+    );
   }
 
   function updateTrimDuration(): void {
-    const startTimeSeconds = parseTime(startTime);
-    const endTimeSeconds = parseTime(endTime);
-    const duration = Math.max(0, endTimeSeconds - startTimeSeconds);
-    trimDuration = formatTime(duration);
+    const track = tracks.find((candidate) => candidate.id === activeTrackId);
+    if (track) updateActiveTrimRange(track);
   }
 
   function displayStatus(message: string, type: string): void {
@@ -1997,6 +2339,8 @@
 
   function setCurrentAsStart(): void {
     if (videoPlayer) {
+      activateClosestTrimRange(videoPlayer.currentTime);
+      selectedAudioMuteRangeIndex = null;
       startTime = formatTime(videoPlayer.currentTime);
       updateTrimDuration();
       saveTrackState();
@@ -2005,6 +2349,8 @@
 
   function setCurrentAsEnd(): void {
     if (videoPlayer) {
+      activateClosestTrimRange(videoPlayer.currentTime);
+      selectedAudioMuteRangeIndex = null;
       endTime = formatTime(videoPlayer.currentTime);
       updateTrimDuration();
       saveTrackState();
@@ -2031,7 +2377,16 @@
       const timeline = document.querySelector('.timeline-container') as HTMLElement;
       if (!timeline) return;
       const rect = timeline.getBoundingClientRect();
-      scrubPointerTime = timeFromTimelineClientX(event.clientX, rect, duration);
+      scrubPointerTime = timeFromTimelineClientX(
+        event.clientX,
+        rect,
+        duration,
+        timelineViewport
+      );
+      if (Math.abs(event.clientX - timelineScrubStartClientX) >= 2) {
+        timelineScrubHasMoved = true;
+      }
+      if (!timelineScrubHasMoved) return;
       safeVideoOperation((player) => {
         smoothTimelineSeek(player, scrubPointerTime, playheadScrubThrottle);
       });
@@ -2052,9 +2407,12 @@
       isUserSeeking = true;
 
       const rect = timeline.getBoundingClientRect();
-      const x = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
-      const percentage = x / rect.width;
-      const newTime = percentage * duration;
+      const newTime = timeFromTimelineClientX(
+        event.clientX,
+        rect,
+        duration,
+        timelineViewport
+      );
 
       const minGap = 0.05; // Minimum 50ms gap between markers
 
@@ -2095,6 +2453,7 @@
           pendingTimelineUiTime = null;
         });
       }
+      timelineScrubHasMoved = false;
     }
 
     const wasDraggingStart = isDraggingStart;
@@ -2145,6 +2504,32 @@
     }
   }
 
+  function togglePlayback(): void {
+    safeVideoOperation((player) => {
+      if (player.paused) {
+        const firstRange = activeTrimRanges[0];
+        const lastRange = activeTrimRanges[activeTrimRanges.length - 1];
+        const isAtTrimEnd = !!lastRange && Math.abs(player.currentTime - lastRange.endTime) <= 0.05;
+
+        if (isAtTrimEnd && firstRange) {
+          pendingTimelineUiTime = firstRange.startTime;
+          preciseTimelineSeek(player, firstRange.startTime, () => {
+            pendingTimelineUiTime = null;
+            player.play().catch((error) => {
+              console.error('Playback restart failed:', error);
+            });
+          });
+        } else {
+          player.play().catch((error) => {
+            console.error('Playback failed:', error);
+          });
+        }
+      } else {
+        player.pause();
+      }
+    });
+  }
+
   // Keyboard shortcut handler with type safety
   function handleKeyboardShortcuts(e: KeyboardEvent): void {
     handleEditorKeybind(
@@ -2169,33 +2554,10 @@
           setCurrentAsEnd();
           displayStatus('End time set to current position', 'success');
         },
+        addTrimRange,
+        deleteTimelineSelection,
         playFromStart,
-        togglePlayback: () => {
-          safeVideoOperation((player) => {
-            if (player.paused) {
-              const isAtTrimEnd =
-                Number.isFinite(endTimeSeconds) &&
-                endTimeSeconds > startTimeSeconds &&
-                Math.abs(player.currentTime - endTimeSeconds) <= 0.05;
-
-              if (isAtTrimEnd) {
-                pendingTimelineUiTime = startTimeSeconds;
-                preciseTimelineSeek(player, startTimeSeconds, () => {
-                  pendingTimelineUiTime = null;
-                  player.play().catch((error) => {
-                    console.error('Playback restart failed:', error);
-                  });
-                });
-              } else {
-                player.play().catch((error) => {
-                  console.error('Playback failed:', error);
-                });
-              }
-            } else {
-              player.pause();
-            }
-          });
-        },
+        togglePlayback,
         stepFrame: (direction) => {
           safeVideoOperation((player) => {
             isUserSeeking = true;
@@ -2421,6 +2783,7 @@
   }
 
   function setAudioWaveformsHidden(hidden: boolean): void {
+    if (hidden) selectedAudioMuteRangeIndex = null;
     audioWaveformsHidden = hidden;
     localStorage.setItem(AUDIO_WAVEFORMS_HIDDEN_KEY, String(hidden));
   }
@@ -2717,10 +3080,8 @@
 
       // Validate times
       for (const t of selectedTracks) {
-        const start = parseTime(t.startTime);
-        const end = parseTime(t.endTime);
-        if (isNaN(start) || isNaN(end) || start < 0 || end <= start) {
-          displayStatus('Invalid start/end time in one of the selected tracks.', 'error');
+        if (getTrackTrimRanges(t).length === 0) {
+          displayStatus('One of the selected tracks has no valid kept sections.', 'error');
           return;
         }
       }
@@ -2742,8 +3103,9 @@
           body: JSON.stringify({
             tracks: selectedTracks.map(t => ({
               videoId: t.uploadedVideoId,
-              startTime: parseTime(t.startTime),
-              endTime: parseTime(t.endTime),
+              startTime: getTrackTrimRanges(t)[0].startTime,
+              endTime: getTrackTrimRanges(t)[0].endTime,
+              trimRanges: getTrackTrimRanges(t),
               audioMode: normalizeAudioOutputMode(t.audioOutputMode),
               audioMuteRanges: normalizeAudioMuteRanges(t.audioMuteRanges)
             })),
@@ -2783,16 +3145,12 @@
       displayStatus('Server is offline. Please start the Node.js server.', 'error');
       return;
     }
-    const startTimeSeconds = parseTime(startTime);
-    const endTimeSeconds = parseTime(endTime);
-    if (isNaN(startTimeSeconds) || startTimeSeconds < 0) {
-      displayStatus('Invalid start time!', 'error');
+    const activeTrackTrimRanges = getTrackTrimRanges(activeTrack);
+    if (activeTrackTrimRanges.length === 0) {
+      displayStatus('Add at least one valid kept section.', 'error');
       return;
     }
-    if (isNaN(endTimeSeconds) || endTimeSeconds <= startTimeSeconds) {
-      displayStatus('End time must be greater than start time!', 'error');
-      return;
-    }
+    const [{ startTime: firstStartTime, endTime: firstEndTime }] = activeTrackTrimRanges;
     showLoadingOverlay = true;
     completedOutput = null;
     loadingMessage = processingAudioMode === 'extract' ? 'Trimming and extracting audio...' : 'Processing video...';
@@ -2814,8 +3172,9 @@
         },
         body: JSON.stringify({
           videoId: activeTrack.uploadedVideoId,
-          startTime: startTimeSeconds,
-          endTime: endTimeSeconds,
+          startTime: firstStartTime,
+          endTime: firstEndTime,
+          trimRanges: activeTrackTrimRanges,
           compressionMode: processingCompressionMode,
           hardwareAcceleration: processingAudioMode === 'extract' ? false : hardwareAccelerationEnabled,
           audioMode: processingAudioMode,
@@ -3350,6 +3709,13 @@
                     </div>                      
                 </div>
 
+                <PlaybackSpeedControl
+                  speed={playbackSpeed}
+                  disabled={!controlsEnabled}
+                  onSpeedChange={setPlaybackSpeed}
+                  onTogglePlayback={togglePlayback}
+                />
+
                 <div class="text-sm font-mono text-slate-200">
                   {formatTime(timelineUiTime)} / {totalDuration}
                 </div>
@@ -3375,15 +3741,10 @@
 
             <Timeline
               {timelineUiTime}
-              {timelineUiPercent}
               {duration}
-              {startPercent}
-              {endPercent}
-              {trimPercent}
-              {startTime}
-              {endTime}
               {startTimeSeconds}
               {endTimeSeconds}
+              {timelineViewport}
               {isDraggingStart}
               {isDraggingEnd}
               {waveformPeaks}
@@ -3394,15 +3755,23 @@
               audioWaveformGloballyHidden={audioWaveformsHidden}
               {audioOutputMode}
               audioMuteRanges={activeAudioMuteRanges}
+              {selectedAudioMuteRangeIndex}
+              trimRanges={activeTrimRanges}
+              {activeTrimRangeIndex}
               onTimelineMouseDown={handleTimelinePlayheadMouseDown}
               onStartMarkerMouseDown={handleStartMarkerMouseDown}
               onEndMarkerMouseDown={handleEndMarkerMouseDown}
+              onTimelineZoom={handleTimelineZoom}
+              onTimelinePan={handleTimelinePan}
+              {resetTimelineZoom}
               onKeydown={handleKeyboardShortcuts}
               {setAudioDetached}
               {setAudioWaveformHidden}
               {setAudioWaveformsHidden}
               {setAudioOutputMode}
               {setAudioMuteRanges}
+              {selectAudioMuteRange}
+              selectTrimRange={selectTrimRange}
             />
           </div>
         </div>
@@ -3415,6 +3784,9 @@
         {controlsEnabled}
         {sidebarsInMainRow}
         {showTrimOverlay}
+        trimRanges={activeTrimRanges}
+        {activeTrimRangeIndex}
+        {canAddTrimRange}
         bind:startTime
         bind:endTime
         {selectedCompressionMode}
@@ -3429,6 +3801,9 @@
         {setCurrentAsStart}
         {setCurrentAsEnd}
         {playFromStart}
+        selectTrimRange={selectTrimRange}
+        {addTrimRange}
+        {removeTrimRange}
         {setCompressionMode}
         {openCompressionPresetModal}
         {toggleCompressionPresetHidden}
